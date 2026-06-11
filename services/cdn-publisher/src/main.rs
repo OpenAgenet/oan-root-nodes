@@ -28,7 +28,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tokio::time::{sleep, Duration as TokioDuration};
+use tokio::{
+    task::JoinSet,
+    time::{sleep, Duration as TokioDuration},
+};
 use url::Url;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -65,6 +68,8 @@ struct RootConfig {
     keys_dir: PathBuf,
     #[serde(default)]
     admin_token: Option<String>,
+    #[serde(default = "default_package_batch_path")]
+    package_batch_path: String,
     #[serde(default = "default_mark_published_path")]
     mark_published_path: String,
 }
@@ -115,7 +120,7 @@ struct PrivateKeyJwk {
 }
 
 fn default_batch_size() -> usize {
-    100
+    200
 }
 
 fn default_fetch_timeout_ms() -> u64 {
@@ -123,7 +128,7 @@ fn default_fetch_timeout_ms() -> u64 {
 }
 
 fn default_max_in_flight() -> usize {
-    16
+    200
 }
 
 fn default_http_timeout_seconds() -> u64 {
@@ -132,6 +137,10 @@ fn default_http_timeout_seconds() -> u64 {
 
 fn default_mark_published_path() -> String {
     "/root/internal/cdn-publication-jobs/mark-published".to_owned()
+}
+
+fn default_package_batch_path() -> String {
+    "/root/internal/cdn-publication-jobs/packages".to_owned()
 }
 
 fn crypto_suite_from_algorithm(value: &str) -> Result<CryptoSuite> {
@@ -288,33 +297,35 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
                     continue;
                 }
             };
-            match decode_and_fetch_package(&state, &message.payload).await {
-                Ok((publication_cursor, package)) => {
-                    batch.push((message, publication_cursor, package));
-                }
+            let decoded = decode_event_payload(&message.payload);
+            batch.push((message, decoded));
+        }
+        let mut prepared = Vec::new();
+        if !batch.is_empty() {
+            match prepare_publish_batch(&state, batch).await {
+                Ok(items) => prepared = items,
                 Err(err) => {
-                    failed += 1;
-                    eprintln!("cdn-publisher failed to prepare task: {err}");
+                    failed += fetched.saturating_sub(acked);
+                    eprintln!("cdn-publisher failed to prepare batch: {err}");
                 }
             }
         }
-        if !batch.is_empty() {
-            let items = batch
+        if !prepared.is_empty() {
+            let items = prepared
                 .iter()
                 .map(|(_, publication_cursor, package)| (*publication_cursor, package.clone()))
                 .collect::<Vec<_>>();
             match publish_packages_to_cdn(&state, items).await {
                 Ok(()) => {
-                    for (message, _, _) in batch {
-                        message
-                            .ack()
-                            .await
-                            .map_err(|err| anyhow!(err.to_string()))?;
-                        acked += 1;
-                    }
+                    let messages = prepared
+                        .into_iter()
+                        .map(|(message, _, _)| message)
+                        .collect::<Vec<_>>();
+                    acked +=
+                        ack_messages(messages, state.config.events.max_in_flight.max(1)).await?;
                 }
                 Err(err) => {
-                    failed += batch.len();
+                    failed += prepared.len();
                     eprintln!("cdn-publisher batch failed: {err}");
                 }
             }
@@ -336,20 +347,93 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
     }
 }
 
-async fn decode_and_fetch_package(
-    state: &AppState,
-    payload: &[u8],
-) -> Result<(i64, ResourcePackage)> {
-    let event = decode_event_payload(payload)?;
-    let package = fetch_resource_package(state, &event).await?;
-    validate_package_matches_event(&package, &event)?;
-    Ok((event.publication_cursor, package))
+async fn ack_messages(
+    messages: Vec<async_nats::jetstream::Message>,
+    concurrency: usize,
+) -> Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let mut acked = 0usize;
+    let mut in_flight = JoinSet::new();
+    let mut iter = messages.into_iter();
+    let concurrency = concurrency.max(1);
+    loop {
+        while in_flight.len() < concurrency {
+            let Some(message) = iter.next() else {
+                break;
+            };
+            in_flight
+                .spawn(async move { message.ack().await.map_err(|err| anyhow!(err.to_string())) });
+        }
+        if in_flight.is_empty() {
+            break;
+        }
+        let Some(result) = in_flight.join_next().await else {
+            break;
+        };
+        result.map_err(|err| anyhow!("cdn_publisher_ack_task_failed:{err}"))??;
+        acked += 1;
+    }
+    Ok(acked)
 }
 
 fn decode_event_payload(payload: &[u8]) -> Result<CdnPublishRequestedEvent> {
     let event: CdnPublishRequestedEvent = serde_json::from_slice(payload)?;
     event.validate().map_err(|err| anyhow!(err))?;
     Ok(event)
+}
+
+async fn prepare_publish_batch(
+    state: &AppState,
+    batch: Vec<(
+        async_nats::jetstream::Message,
+        Result<CdnPublishRequestedEvent>,
+    )>,
+) -> Result<Vec<(async_nats::jetstream::Message, i64, ResourcePackage)>> {
+    let mut decoded = Vec::new();
+    for (message, event) in batch {
+        match event {
+            Ok(event) => decoded.push((message, event)),
+            Err(err) => {
+                eprintln!("cdn-publisher failed to decode task: {err}");
+            }
+        }
+    }
+    if decoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let events = decoded
+        .iter()
+        .map(|(_, event)| event.clone())
+        .collect::<Vec<_>>();
+    let packages = prepare_packages_for_events(state, &events).await?;
+    let mut prepared = Vec::new();
+    for (message, event) in decoded {
+        let job_key = format!("{}:{}", event.resource_did, event.package_version);
+        let Some((publication_cursor, package)) = packages.get(&job_key) else {
+            return Err(anyhow!("root_package_missing:{job_key}"));
+        };
+        validate_package_matches_event(package, &event)?;
+        prepared.push((message, *publication_cursor, package.clone()));
+    }
+    Ok(prepared)
+}
+
+async fn prepare_packages_for_events(
+    state: &AppState,
+    events: &[CdnPublishRequestedEvent],
+) -> Result<std::collections::BTreeMap<String, (i64, ResourcePackage)>> {
+    let event_refs = events.iter().collect::<Vec<_>>();
+    let packages = fetch_resource_packages_batch(state, event_refs.as_slice()).await?;
+    for event in events {
+        let job_key = format!("{}:{}", event.resource_did, event.package_version);
+        let Some((_, package)) = packages.get(&job_key) else {
+            return Err(anyhow!("root_package_missing:{job_key}"));
+        };
+        validate_package_matches_event(package, event)?;
+    }
+    Ok(packages)
 }
 
 fn validate_package_matches_event(
@@ -374,45 +458,79 @@ fn validate_package_matches_event(
     Ok(())
 }
 
-async fn fetch_resource_package(
+async fn fetch_resource_packages_batch(
     state: &AppState,
-    event: &CdnPublishRequestedEvent,
-) -> Result<ResourcePackage> {
-    let url = root_version_detail_url(
-        &state.config.root.endpoint,
-        &event.resource_did,
-        &event.package_version,
-    )?;
-    let value = state
-        .client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-    let package_value = value
-        .get("package")
-        .ok_or_else(|| anyhow!("root_package_missing"))?;
-    if package_value.is_null() {
-        return Err(anyhow!("root_package_missing"));
+    events: &[&CdnPublishRequestedEvent],
+) -> Result<std::collections::BTreeMap<String, (i64, ResourcePackage)>> {
+    if events.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
     }
-    Ok(serde_json::from_value(package_value.clone())?)
+    let Some(admin_token) = state.config.root.admin_token.as_ref() else {
+        return Err(anyhow!("root_admin_token_required_for_package_batch"));
+    };
+    let url = root_package_batch_url(
+        &state.config.root.endpoint,
+        &state.config.root.package_batch_path,
+    )?;
+    let jobs = events
+        .iter()
+        .map(|event| {
+            json!({
+                "resource_did": event.resource_did,
+                "package_version": event.package_version
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = state
+        .client
+        .post(url)
+        .bearer_auth(admin_token)
+        .json(&json!({ "jobs": jobs }))
+        .send()
+        .await?;
+    let status = response.status();
+    let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(anyhow!("root_package_batch_failed:{status}:{value}"));
+    }
+    let mut packages = std::collections::BTreeMap::new();
+    for item in value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?
+    {
+        let job_key = item
+            .get("jobKey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("root_package_batch_job_key_missing"))?
+            .to_owned();
+        let publication_cursor = item
+            .get("publicationCursor")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("root_package_batch_cursor_missing"))?;
+        let package = serde_json::from_value::<ResourcePackage>(
+            item.get("package")
+                .ok_or_else(|| anyhow!("root_package_batch_package_missing"))?
+                .clone(),
+        )?;
+        packages.insert(job_key, (publication_cursor, package));
+    }
+    Ok(packages)
 }
 
-fn root_version_detail_url(root_endpoint: &str, did: &str, version: &str) -> Result<Url> {
+
+fn root_package_batch_url(root_endpoint: &str, path: &str) -> Result<Url> {
     let mut url = Url::parse(root_endpoint)?;
     {
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| anyhow!("root_endpoint_cannot_be_base"))?;
-        segments
-            .pop_if_empty()
-            .push("root")
-            .push("resources")
-            .push(did)
-            .push("versions")
-            .push(version);
+        segments.pop_if_empty();
+        for segment in path.trim_start_matches('/').split('/') {
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
     }
     Ok(url)
 }

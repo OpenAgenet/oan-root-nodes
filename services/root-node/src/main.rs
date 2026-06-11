@@ -49,9 +49,13 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::time::{sleep, Duration as TokioDuration};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{Notify, Semaphore},
+    task::JoinSet,
+};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 mod repository;
@@ -64,6 +68,7 @@ const ROOT_SUBJECT_LATEST_TABLE: &str = "root_subject_latest";
 const ROOT_SUBJECT_VERSION_TABLE: &str = "root_subject_versions";
 const ROOT_PACKAGE_JOB_TABLE: &str = "root_verified_package_jobs";
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
+const ROOT_STATUS_CACHE_TTL_MS: u64 = 100;
 
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
@@ -331,7 +336,7 @@ fn default_discovery_worker_interval_ms() -> u64 {
 }
 
 fn default_cdn_worker_batch_size() -> usize {
-    50
+    200
 }
 
 fn default_discovery_worker_batch_size() -> usize {
@@ -409,7 +414,17 @@ struct AppState {
     event_publisher: EventPublisher,
     worker_runtime: Arc<Mutex<WorkerRuntimeState>>,
     event_runtime: Arc<Mutex<EventRuntimeState>>,
+    admission_runtime: Arc<Mutex<AdmissionRuntimeState>>,
+    status_counts_cache: Arc<Mutex<Option<CachedRootStatusCounts>>>,
     admission_semaphore: Arc<Semaphore>,
+    cdn_worker_notify: Arc<Notify>,
+    discovery_worker_notify: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedRootStatusCounts {
+    captured_at: Instant,
+    counts: RootStatusCounts,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -417,11 +432,17 @@ struct WorkerRuntimeState {
     cdn_last_elapsed_ms: u128,
     cdn_last_success_count: usize,
     cdn_last_failed_count: usize,
+    cdn_last_progress_elapsed_ms: u128,
+    cdn_last_progress_success_count: usize,
+    cdn_last_progress_failed_count: usize,
     cdn_effective_batch_size: usize,
     cdn_effective_concurrency: usize,
     discovery_last_elapsed_ms: u128,
     discovery_last_success_count: usize,
     discovery_last_failed_count: usize,
+    discovery_last_progress_elapsed_ms: u128,
+    discovery_last_progress_success_count: usize,
+    discovery_last_progress_failed_count: usize,
     discovery_effective_batch_size: usize,
     discovery_effective_concurrency: usize,
     updated_at: Option<chrono::DateTime<Utc>>,
@@ -741,6 +762,16 @@ struct DiscoveryAuthorizationState {
     tag_tree_version: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+struct AdmissionRuntimeState {
+    last_wait_ms: u128,
+    max_wait_ms: u128,
+    accepted_count: u64,
+    busy_rejected_count: u64,
+    last_error: Option<String>,
+    updated_at: Option<chrono::DateTime<Utc>>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -770,6 +801,13 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn busy(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
         }
     }
@@ -810,6 +848,11 @@ struct CdnPublicationJobRef {
 
 #[derive(Clone, Debug, Deserialize)]
 struct MarkCdnPublicationJobsPublishedRequest {
+    jobs: Vec<CdnPublicationJobRef>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CdnPublicationJobsPackageRequest {
     jobs: Vec<CdnPublicationJobRef>,
 }
 
@@ -896,9 +939,13 @@ async fn main() -> Result<()> {
             cdn_publish_subject: config.events.cdn_publish_subject.clone(),
             ..Default::default()
         })),
+        admission_runtime: Arc::new(Mutex::new(AdmissionRuntimeState::default())),
+        status_counts_cache: Arc::new(Mutex::new(None)),
         admission_semaphore: Arc::new(Semaphore::new(
             config.security.workers.admission_concurrency.max(1),
         )),
+        cdn_worker_notify: Arc::new(Notify::new()),
+        discovery_worker_notify: Arc::new(Notify::new()),
     };
 
     bootstrap_root_bulletin_from_json(&state).await?;
@@ -928,6 +975,10 @@ async fn main() -> Result<()> {
         .route(
             "/root/internal/cdn-publication-jobs/mark-published",
             post(api_mark_cdn_publication_jobs_published),
+        )
+        .route(
+            "/root/internal/cdn-publication-jobs/packages",
+            post(api_cdn_publication_jobs_packages),
         )
         .route("/root/queues/cdn-publish", get(api_cdn_publish_queue))
         .route(
@@ -1125,20 +1176,57 @@ fn spawn_trust_indexer_watcher(state: AppState) {
 async fn root_cdn_outbox_relay_loop(state: AppState) {
     let interval_ms = state.config.security.workers.cdn_interval_ms.max(100);
     loop {
-        if let Err(err) = run_cdn_outbox_relay_cycle(&state).await {
-            eprintln!("root cdn outbox relay cycle failed: {err}");
+        let made_progress = match run_cdn_outbox_relay_cycle(&state).await {
+            Ok(result) => {
+                result
+                    .get("attemptedCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+            }
+            Err(err) => {
+                eprintln!("root cdn outbox relay cycle failed: {err}");
+                false
+            }
+        };
+        if made_progress {
+            continue;
         }
-        sleep(TokioDuration::from_millis(interval_ms)).await;
+        tokio::select! {
+            _ = state.cdn_worker_notify.notified() => {}
+            _ = sleep(TokioDuration::from_millis(interval_ms)) => {}
+        }
     }
 }
 
 async fn root_discovery_worker_loop(state: AppState) {
     let interval_ms = state.config.security.workers.discovery_interval_ms.max(100);
     loop {
-        if let Err(err) = run_discovery_notify_cycle(&state).await {
-            eprintln!("root discovery worker cycle failed: {err}");
+        let made_progress = match run_discovery_notify_cycle(&state).await {
+            Ok(result) => {
+                result
+                    .get("notifiedCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                    || result
+                        .get("failedCount")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        > 0
+            }
+            Err(err) => {
+                eprintln!("root discovery worker cycle failed: {err}");
+                false
+            }
+        };
+        if made_progress {
+            continue;
         }
-        sleep(TokioDuration::from_millis(interval_ms)).await;
+        tokio::select! {
+            _ = state.discovery_worker_notify.notified() => {}
+            _ = sleep(TokioDuration::from_millis(interval_ms)) => {}
+        }
     }
 }
 
@@ -1707,12 +1795,18 @@ async fn verify_resource_and_publish(
     State(state): State<AppState>,
     Json(request): Json<ResourceVerifyAndPublishRequest>,
 ) -> ApiResult<Value> {
-    let _admission_permit = state
-        .admission_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(ApiError::internal)?;
+    let admission_started = Instant::now();
+    let _admission_permit = tokio::time::timeout(
+        TokioDuration::from_secs(state.config.security.workers.http_timeout_seconds.max(1)),
+        state.admission_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        record_admission_busy(&state, admission_started.elapsed().as_millis());
+        ApiError::busy("root_admission_busy")
+    })?
+    .map_err(ApiError::internal)?;
+    record_admission_accepted(&state, admission_started.elapsed().as_millis());
     verify_resource_request(&state, &request).map_err(ApiError::bad_request)?;
     ensure_governance_active(
         &state,
@@ -2067,7 +2161,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
     let authorization_state =
         load_authorization_state(&state.config.paths.authorization_state_file)
             .unwrap_or_else(|_| state.authorization_state.clone());
-    if let Some(counts) = root_status_counts_from_database(&state)
+    if let Some(counts) = cached_root_status_counts_from_database(&state)
         .await
         .map_err(ApiError::internal)?
     {
@@ -2092,6 +2186,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
             "workerProfile": worker_profile_json(&state.config.security.workers),
             "workerRuntime": worker_runtime_json(&state),
             "eventRuntime": event_runtime_json(&state),
+            "admissionRuntime": admission_runtime_json(&state),
             "trustIndexer": {
                 "enabled": state.config.security.trust_indexer.enabled,
                 "endpoint": state.config.security.trust_indexer.endpoint,
@@ -2133,6 +2228,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "workerProfile": worker_profile_json(&state.config.security.workers),
         "workerRuntime": worker_runtime_json(&state),
         "eventRuntime": event_runtime_json(&state),
+        "admissionRuntime": admission_runtime_json(&state),
         "trustIndexer": {
             "enabled": state.config.security.trust_indexer.enabled,
             "endpoint": state.config.security.trust_indexer.endpoint,
@@ -2175,6 +2271,20 @@ fn event_runtime_json(state: &AppState) -> Value {
         .unwrap_or_else(|_| json!({"status": "unavailable"}))
 }
 
+fn admission_runtime_json(state: &AppState) -> Value {
+    state
+        .admission_runtime
+        .lock()
+        .map(|runtime| serde_json::to_value(&*runtime).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|_| json!({"status": "unavailable"}))
+}
+
+fn invalidate_status_counts_cache(state: &AppState) {
+    if let Ok(mut cache) = state.status_counts_cache.lock() {
+        *cache = None;
+    }
+}
+
 fn effective_worker_batch_size(
     configured: usize,
     ready_depth: usize,
@@ -2202,8 +2312,56 @@ fn record_discovery_worker_runtime(
         runtime.discovery_last_elapsed_ms = elapsed_ms;
         runtime.discovery_last_success_count = success_count;
         runtime.discovery_last_failed_count = failed_count;
+        if success_count > 0 || failed_count > 0 {
+            runtime.discovery_last_progress_elapsed_ms = elapsed_ms;
+            runtime.discovery_last_progress_success_count = success_count;
+            runtime.discovery_last_progress_failed_count = failed_count;
+        }
         runtime.discovery_effective_batch_size = batch_size;
         runtime.discovery_effective_concurrency = concurrency;
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_admission_accepted(state: &AppState, wait_ms: u128) {
+    if let Ok(mut runtime) = state.admission_runtime.lock() {
+        runtime.last_wait_ms = wait_ms;
+        runtime.max_wait_ms = runtime.max_wait_ms.max(wait_ms);
+        runtime.accepted_count = runtime.accepted_count.saturating_add(1);
+        runtime.last_error = None;
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_admission_busy(state: &AppState, wait_ms: u128) {
+    if let Ok(mut runtime) = state.admission_runtime.lock() {
+        runtime.last_wait_ms = wait_ms;
+        runtime.max_wait_ms = runtime.max_wait_ms.max(wait_ms);
+        runtime.busy_rejected_count = runtime.busy_rejected_count.saturating_add(1);
+        runtime.last_error = Some("root_admission_busy".to_owned());
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_cdn_worker_runtime(
+    state: &AppState,
+    elapsed_ms: u128,
+    success_count: usize,
+    failed_count: usize,
+    batch_size: usize,
+    concurrency: usize,
+) {
+    if let Ok(mut runtime) = state.worker_runtime.lock() {
+        runtime.cdn_last_elapsed_ms = elapsed_ms;
+        runtime.cdn_last_success_count = success_count;
+        runtime.cdn_last_failed_count = failed_count;
+        if success_count > 0 || failed_count > 0 {
+            runtime.cdn_last_progress_elapsed_ms = elapsed_ms;
+            runtime.cdn_last_progress_success_count = success_count;
+            runtime.cdn_last_progress_failed_count = failed_count;
+        }
+        runtime.cdn_effective_batch_size = batch_size;
+        runtime.cdn_effective_concurrency = concurrency;
         runtime.updated_at = Some(Utc::now());
     }
 }
@@ -2224,7 +2382,7 @@ fn record_event_publish_failure(state: &AppState, error: &str) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RootStatusCounts {
     backend: &'static str,
     bulletin_event_count: i64,
@@ -2235,6 +2393,28 @@ struct RootStatusCounts {
     cdn_outbox_active_count: i64,
     discovery_ready_queue_count: i64,
     discovery_pending_queue_count: i64,
+}
+
+async fn cached_root_status_counts_from_database(
+    state: &AppState,
+) -> Result<Option<RootStatusCounts>> {
+    if let Ok(cache) = state.status_counts_cache.lock() {
+        if let Some(cached) = cache.as_ref() {
+            if cached.captured_at.elapsed() <= StdDuration::from_millis(ROOT_STATUS_CACHE_TTL_MS) {
+                return Ok(Some(cached.counts.clone()));
+            }
+        }
+    }
+    let counts = root_status_counts_from_database(state).await?;
+    if let Some(counts) = counts.as_ref() {
+        if let Ok(mut cache) = state.status_counts_cache.lock() {
+            *cache = Some(CachedRootStatusCounts {
+                captured_at: Instant::now(),
+                counts: counts.clone(),
+            });
+        }
+    }
+    Ok(counts)
 }
 
 async fn root_status_counts_from_database(state: &AppState) -> Result<Option<RootStatusCounts>> {
@@ -2321,81 +2501,57 @@ async fn root_status_counts_from_database(state: &AppState) -> Result<Option<Roo
         }));
     }
     if let Some(postgres) = &state.postgres {
-        let bulletin_event_count =
-            sqlx::query(&format!("SELECT COUNT(*) FROM {ROOT_BULLETIN_EVENT_TABLE}"))
-                .fetch_one(postgres.pool())
-                .await?
-                .get::<i64, _>(0);
-        let latest_version_count =
-            sqlx::query(&format!("SELECT COUNT(*) FROM {ROOT_SUBJECT_LATEST_TABLE}"))
-                .fetch_one(postgres.pool())
-                .await?
-                .get::<i64, _>(0);
-        let cdn_ready_queue_count = sqlx::query(&format!(
+        let row = sqlx::query(&format!(
             r#"
-            SELECT COUNT(*) FROM {ROOT_CDN_JOB_TABLE}
-            WHERE status = 'ready'
-               OR (status = 'retry-wait' AND next_attempt_at <= $1::timestamptz)
-               OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1::timestamptz)
+            SELECT
+                (SELECT COUNT(*) FROM {ROOT_BULLETIN_EVENT_TABLE}) AS bulletin_event_count,
+                (SELECT COUNT(*) FROM {ROOT_SUBJECT_LATEST_TABLE}) AS latest_version_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_CDN_JOB_TABLE}
+                    WHERE status = 'ready'
+                       OR (status = 'retry-wait' AND next_attempt_at <= $1::timestamptz)
+                       OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1::timestamptz)
+                ) AS cdn_ready_queue_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_CDN_JOB_TABLE}
+                    WHERE status IN ('ready', 'leased', 'retry-wait')
+                ) AS cdn_active_queue_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_CDN_OUTBOX_TABLE}
+                    WHERE status = 'ready'
+                       OR (status = 'retry-wait' AND next_attempt_at <= $1::timestamptz)
+                       OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1::timestamptz)
+                ) AS cdn_outbox_ready_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_CDN_OUTBOX_TABLE}
+                    WHERE status IN ('ready', 'leased', 'retry-wait')
+                ) AS cdn_outbox_active_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_DISCOVERY_TARGET_TABLE}
+                    WHERE status = 'active'
+                      AND pending_cursor > delivered_cursor
+                      AND next_attempt_at <= $1::timestamptz
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= $1::timestamptz)
+                ) AS discovery_ready_queue_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_DISCOVERY_TARGET_TABLE}
+                    WHERE status = 'active' AND pending_cursor > delivered_cursor
+                ) AS discovery_pending_queue_count
             "#
         ))
         .bind(&now)
         .fetch_one(postgres.pool())
-        .await?
-        .get::<i64, _>(0);
-        let cdn_active_queue_count = sqlx::query(&format!(
-            "SELECT COUNT(*) FROM {ROOT_CDN_JOB_TABLE} WHERE status IN ('ready', 'leased', 'retry-wait')"
-        ))
-        .fetch_one(postgres.pool())
-        .await?
-        .get::<i64, _>(0);
-        let cdn_outbox_ready_count = sqlx::query(&format!(
-            r#"
-            SELECT COUNT(*) FROM {ROOT_CDN_OUTBOX_TABLE}
-            WHERE status = 'ready'
-               OR (status = 'retry-wait' AND next_attempt_at <= $1::timestamptz)
-               OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1::timestamptz)
-            "#
-        ))
-        .bind(&now)
-        .fetch_one(postgres.pool())
-        .await?
-        .get::<i64, _>(0);
-        let cdn_outbox_active_count = sqlx::query(&format!(
-            "SELECT COUNT(*) FROM {ROOT_CDN_OUTBOX_TABLE} WHERE status IN ('ready', 'leased', 'retry-wait')"
-        ))
-        .fetch_one(postgres.pool())
-        .await?
-        .get::<i64, _>(0);
-        let discovery_ready_queue_count = sqlx::query(&format!(
-            r#"
-            SELECT COUNT(*) FROM {ROOT_DISCOVERY_TARGET_TABLE}
-            WHERE status = 'active'
-              AND pending_cursor > delivered_cursor
-              AND next_attempt_at <= $1::timestamptz
-              AND (lease_expires_at IS NULL OR lease_expires_at <= $1::timestamptz)
-            "#
-        ))
-        .bind(&now)
-        .fetch_one(postgres.pool())
-        .await?
-        .get::<i64, _>(0);
-        let discovery_pending_queue_count = sqlx::query(&format!(
-            "SELECT COUNT(*) FROM {ROOT_DISCOVERY_TARGET_TABLE} WHERE status = 'active' AND pending_cursor > delivered_cursor"
-        ))
-        .fetch_one(postgres.pool())
-        .await?
-        .get::<i64, _>(0);
+        .await?;
         return Ok(Some(RootStatusCounts {
             backend: "postgres",
-            bulletin_event_count,
-            latest_version_count,
-            cdn_ready_queue_count,
-            cdn_active_queue_count,
-            cdn_outbox_ready_count,
-            cdn_outbox_active_count,
-            discovery_ready_queue_count,
-            discovery_pending_queue_count,
+            bulletin_event_count: row.get::<i64, _>("bulletin_event_count"),
+            latest_version_count: row.get::<i64, _>("latest_version_count"),
+            cdn_ready_queue_count: row.get::<i64, _>("cdn_ready_queue_count"),
+            cdn_active_queue_count: row.get::<i64, _>("cdn_active_queue_count"),
+            cdn_outbox_ready_count: row.get::<i64, _>("cdn_outbox_ready_count"),
+            cdn_outbox_active_count: row.get::<i64, _>("cdn_outbox_active_count"),
+            discovery_ready_queue_count: row.get::<i64, _>("discovery_ready_queue_count"),
+            discovery_pending_queue_count: row.get::<i64, _>("discovery_pending_queue_count"),
         }));
     }
     Ok(None)
@@ -2637,10 +2793,52 @@ async fn api_mark_cdn_publication_jobs_published(
         advance_discovery_target_watermarks_batch(&state, &package_cursors)
             .await
             .map_err(ApiError::internal)?;
+    if advanced_discovery_count > 0 {
+        state.discovery_worker_notify.notify_waiters();
+    }
     Ok(Json(json!({
         "status": "ok",
         "markedCount": jobs.len(),
         "advancedDiscoveryCount": advanced_discovery_count
+    })))
+}
+
+async fn api_cdn_publication_jobs_packages(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CdnPublicationJobsPackageRequest>,
+) -> ApiResult<Value> {
+    let _principal = require_admin(&headers, &state)?;
+    if request.jobs.is_empty() {
+        return Err(ApiError::bad_request("empty_jobs"));
+    }
+    let job_keys = request
+        .jobs
+        .iter()
+        .map(|job| format!("{}:{}", job.resource_did, job.package_version))
+        .collect::<Vec<_>>();
+    let packages = resource_packages_for_jobs(&state, &job_keys)
+        .await
+        .map_err(ApiError::internal)?;
+    let items = request
+        .jobs
+        .iter()
+        .filter_map(|job| {
+            let job_key = format!("{}:{}", job.resource_did, job.package_version);
+            packages.get(&job_key).map(|(package, publication_cursor)| {
+                json!({
+                    "jobKey": job_key,
+                    "publicationCursor": publication_cursor,
+                    "package": package
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "status": "ok",
+        "requestedCount": request.jobs.len(),
+        "foundCount": items.len(),
+        "items": items
     })))
 }
 
@@ -3239,7 +3437,10 @@ fn archive_resource_verified(state: &AppState, package: &ResourcePackage) -> Res
 }
 
 async fn persist_resource_acceptance(state: &AppState, package: &ResourcePackage) -> Result<()> {
-    repository::persist_resource_acceptance_impl(state, package).await
+    repository::persist_resource_acceptance_impl(state, package).await?;
+    invalidate_status_counts_cache(state);
+    state.cdn_worker_notify.notify_one();
+    Ok(())
 }
 
 async fn enqueue_resource_cdn(state: &AppState, package: &ResourcePackage) -> Result<()> {
@@ -3561,7 +3762,9 @@ async fn mark_discovery_target_notified(
     discovery_did: &str,
     delivered_cursor: i64,
 ) -> Result<()> {
-    repository::mark_discovery_target_notified_impl(state, discovery_did, delivered_cursor).await
+    repository::mark_discovery_target_notified_impl(state, discovery_did, delivered_cursor).await?;
+    invalidate_status_counts_cache(state);
+    Ok(())
 }
 
 async fn mark_discovery_target_retry(
@@ -3569,14 +3772,21 @@ async fn mark_discovery_target_retry(
     discovery_did: &str,
     error: &str,
 ) -> Result<()> {
-    repository::mark_discovery_target_retry_impl(state, discovery_did, error).await
+    repository::mark_discovery_target_retry_impl(state, discovery_did, error).await?;
+    invalidate_status_counts_cache(state);
+    Ok(())
 }
 
 async fn advance_discovery_target_watermarks_batch(
     state: &AppState,
     packages: &[(ResourcePackage, i64)],
 ) -> Result<usize> {
-    repository::advance_discovery_target_watermarks_batch_impl(state, packages).await
+    let updated =
+        repository::advance_discovery_target_watermarks_batch_impl(state, packages).await?;
+    if updated > 0 {
+        invalidate_status_counts_cache(state);
+    }
+    Ok(updated)
 }
 
 async fn resource_packages_for_jobs(
@@ -3587,7 +3797,9 @@ async fn resource_packages_for_jobs(
 }
 
 async fn mark_cdn_jobs_published_batch(state: &AppState, jobs: &[(String, String)]) -> Result<()> {
-    repository::mark_cdn_jobs_published_batch_impl(state, jobs).await
+    repository::mark_cdn_jobs_published_batch_impl(state, jobs).await?;
+    invalidate_status_counts_cache(state);
+    Ok(())
 }
 
 async fn claim_cdn_outbox_events(
@@ -3599,12 +3811,26 @@ async fn claim_cdn_outbox_events(
     repository::claim_cdn_outbox_events_impl(state, worker_id, limit, lease_seconds).await
 }
 
-async fn mark_cdn_outbox_event_published(state: &AppState, job_key: &str) -> Result<()> {
-    repository::mark_cdn_outbox_event_published_impl(state, job_key).await
+async fn mark_cdn_outbox_events_published_batch(
+    state: &AppState,
+    job_keys: &[String],
+) -> Result<u64> {
+    let updated = repository::mark_cdn_outbox_events_published_batch_impl(state, job_keys).await?;
+    if updated > 0 {
+        invalidate_status_counts_cache(state);
+    }
+    Ok(updated)
 }
 
-async fn mark_cdn_outbox_event_retry(state: &AppState, job_key: &str, error: &str) -> Result<()> {
-    repository::mark_cdn_outbox_event_retry_impl(state, job_key, error).await
+async fn mark_cdn_outbox_events_retry_batch(
+    state: &AppState,
+    jobs: &[(String, String)],
+) -> Result<u64> {
+    let updated = repository::mark_cdn_outbox_events_retry_batch_impl(state, jobs).await?;
+    if updated > 0 {
+        invalidate_status_counts_cache(state);
+    }
+    Ok(updated)
 }
 
 
@@ -3624,12 +3850,15 @@ async fn authorized_discovery_summary_items(
 }
 
 async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
-    let ready_depth = root_status_counts_from_database(state)
-        .await?
-        .map(|counts| counts.cdn_outbox_ready_count as usize)
-        .unwrap_or(0);
-    let batch_size =
-        effective_worker_batch_size(state.config.security.workers.cdn_batch_size, ready_depth, 4);
+    let started = std::time::Instant::now();
+    let batch_size = state
+        .config
+        .security
+        .workers
+        .cdn_batch_size
+        .max(1)
+        .saturating_mul(4)
+        .min(5_000);
     let worker_id = request_id("root-cdn-outbox-relay");
     let claimed = claim_cdn_outbox_events(
         state,
@@ -3639,30 +3868,70 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
     )
     .await?;
     let attempted_count = claimed.len();
+    let concurrency = state.config.security.workers.cdn_concurrency.max(1);
     let mut published = Vec::new();
     let mut failed = Vec::new();
-    for (job_key, event) in claimed {
-        match publish_cdn_requested_outbox_event(state, &event).await {
-            Ok(()) => {
-                mark_cdn_outbox_event_published(state, &job_key).await?;
-                published.push(job_key);
-            }
-            Err(err) => {
-                let error = err.to_string();
-                mark_cdn_outbox_event_retry(state, &job_key, &error).await?;
-                failed.push(json!({
-                    "jobKey": job_key,
-                    "error": error,
-                    "mode": state.config.events.failure_mode
-                }));
-            }
+    let mut in_flight = JoinSet::new();
+    let mut claimed_iter = claimed.into_iter();
+    loop {
+        while in_flight.len() < concurrency {
+            let Some((job_key, event)) = claimed_iter.next() else {
+                break;
+            };
+            let state = state.clone();
+            in_flight.spawn(async move {
+                let result = publish_cdn_requested_outbox_event(&state, &event).await;
+                (job_key, result)
+            });
+        }
+        if in_flight.is_empty() {
+            break;
+        }
+        let Some(joined) = in_flight.join_next().await else {
+            break;
+        };
+        let (job_key, result) =
+            joined.map_err(|err| anyhow!("cdn_outbox_publish_task_failed:{err}"))?;
+        match result {
+            Ok(()) => published.push(job_key),
+            Err(err) => failed.push(json!({
+                "jobKey": job_key,
+                "error": err.to_string(),
+                "mode": state.config.events.failure_mode
+            })),
         }
     }
+    let failed_jobs = failed
+        .iter()
+        .filter_map(|item| {
+            Some((
+                item.get("jobKey")?.as_str()?.to_owned(),
+                item.get("error")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let marked_published_count = mark_cdn_outbox_events_published_batch(state, &published).await?;
+    let marked_retry_count = mark_cdn_outbox_events_retry_batch(state, &failed_jobs).await?;
+    let elapsed_ms = started.elapsed().as_millis();
+    record_cdn_worker_runtime(
+        state,
+        elapsed_ms,
+        published.len(),
+        failed.len(),
+        batch_size,
+        concurrency,
+    );
     Ok(json!({
         "enabled": true,
         "attemptedCount": attempted_count,
         "publishedCount": published.len(),
         "failedCount": failed.len(),
+        "concurrency": concurrency,
+        "effectiveBatchSize": batch_size,
+        "elapsedMs": elapsed_ms,
+        "drainRatePerSec": drain_rate_per_sec(published.len(), elapsed_ms),
+        "markedPublishedCount": marked_published_count,
+        "markedRetryCount": marked_retry_count,
         "published": published,
         "failed": failed
     }))
