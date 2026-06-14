@@ -469,6 +469,7 @@ struct WorkerRuntimeState {
     discovery_last_prepare_elapsed_ms: u128,
     discovery_last_notify_elapsed_ms: u128,
     discovery_effective_batch_size: usize,
+    discovery_effective_item_batch_size: usize,
     discovery_effective_concurrency: usize,
     discovery_last_trigger_type: Option<String>,
     discovery_last_event_to_cycle_start_ms: u128,
@@ -476,6 +477,11 @@ struct WorkerRuntimeState {
     discovery_event_trigger_count: u64,
     discovery_timer_trigger_count: u64,
     discovery_noop_cycle_count: u64,
+    discovery_last_claimed_target_count: usize,
+    discovery_last_carry_forward_count: usize,
+    discovery_last_ready_queue_depth_after: usize,
+    discovery_last_pending_queue_depth_after: usize,
+    discovery_last_claimed_cursor_lag: i64,
     mark_published_last_fetch_elapsed_ms: u128,
     mark_published_last_fetch_sql_elapsed_ms: u128,
     mark_published_last_watermark_match_elapsed_ms: u128,
@@ -487,6 +493,8 @@ struct WorkerRuntimeState {
     mark_published_last_total_elapsed_ms: u128,
     mark_published_last_job_count: usize,
     mark_published_total_call_count: u64,
+    mark_published_max_update_elapsed_ms: u128,
+    mark_published_max_total_elapsed_ms: u128,
     updated_at: Option<chrono::DateTime<Utc>>,
 }
 
@@ -509,6 +517,39 @@ struct DiscoveryWorkerStageMetrics {
     claim_elapsed_ms: u128,
     prepare_elapsed_ms: u128,
     notify_elapsed_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiscoveryWorkerOutcomeMetrics {
+    claimed_target_count: usize,
+    carry_forward_count: usize,
+    ready_queue_depth_after: usize,
+    pending_queue_depth_after: usize,
+    claimed_cursor_lag: i64,
+    item_batch_size: usize,
+}
+
+struct DiscoveryWorkerRuntimeSample {
+    elapsed_ms: u128,
+    success_count: usize,
+    failed_count: usize,
+    batch_size: usize,
+    concurrency: usize,
+    stage_metrics: DiscoveryWorkerStageMetrics,
+    outcome_metrics: DiscoveryWorkerOutcomeMetrics,
+}
+
+struct MarkPublishedRuntimeSample {
+    job_count: usize,
+    fetch_elapsed_ms: u128,
+    fetch_sql_elapsed_ms: u128,
+    watermark_match_elapsed_ms: u128,
+    update_elapsed_ms: u128,
+    watermark_elapsed_ms: u128,
+    store_items_elapsed_ms: u128,
+    upsert_targets_elapsed_ms: u128,
+    delete_jobs_elapsed_ms: u128,
+    total_elapsed_ms: u128,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1878,8 +1919,12 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_root_discovery_target_active_ready
             ON {ROOT_DISCOVERY_TARGET_TABLE}(next_attempt_at, lease_expires_at, pending_cursor DESC, discovery_did)
             WHERE status = 'active' AND pending_cursor > delivered_cursor;
+            CREATE INDEX IF NOT EXISTS idx_root_discovery_target_delivery_progress
+            ON {ROOT_DISCOVERY_TARGET_TABLE}(discovery_did, delivered_cursor, pending_cursor);
             CREATE INDEX IF NOT EXISTS idx_root_discovery_items_target_cursor
             ON {ROOT_DISCOVERY_ITEM_TABLE}(discovery_did, publication_cursor);
+            CREATE INDEX IF NOT EXISTS idx_root_discovery_items_gc
+            ON {ROOT_DISCOVERY_ITEM_TABLE}(discovery_did, publication_cursor DESC);
             "#
         ))
         .await?;
@@ -1916,6 +1961,8 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
             ON {ROOT_CDN_JOB_TABLE}(job_key, publication_cursor);
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_ready_projection
             ON {ROOT_CDN_JOB_TABLE}(status, next_attempt_at, lease_expires_at, publication_cursor, job_key);
+            CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_publication_projection
+            ON {ROOT_CDN_JOB_TABLE}(publication_cursor, job_key, resource_did, package_version);
             "#
         ))
         .await?;
@@ -2067,10 +2114,7 @@ async fn verify_resource_and_publish(
         created_at: Utc::now(),
     };
     package
-        .verify_did_document_hash()
-        .and_then(|_| package.verify_metadata_hash())
-        .and_then(|_| package.verify_package_hash())
-        .and_then(|_| package.verify_resource_type_consistency())
+        .verify_resource_type_consistency()
         .and_then(|_| package.verify_metadata_consistency())
         .and_then(|_| package.verify_root_claim_binding())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -2461,15 +2505,25 @@ fn effective_worker_batch_size(
     }
 }
 
-fn record_discovery_worker_runtime(
-    state: &AppState,
-    elapsed_ms: u128,
-    success_count: usize,
-    failed_count: usize,
-    batch_size: usize,
+fn effective_discovery_target_item_batch_size(
+    configured: usize,
+    claimed_target_count: usize,
     concurrency: usize,
-    stage_metrics: DiscoveryWorkerStageMetrics,
-) {
+    claimed_cursor_lag: i64,
+) -> usize {
+    let base = configured.max(1);
+    let lag = claimed_cursor_lag.max(0) as usize;
+    let active_targets = claimed_target_count.max(1);
+    if active_targets <= concurrency.max(1) / 2 && lag > base.saturating_mul(active_targets * 2) {
+        return base.saturating_mul(4).min(1_000);
+    }
+    if active_targets <= concurrency.max(1) && lag > base.saturating_mul(active_targets) {
+        return base.saturating_mul(2).min(500);
+    }
+    base
+}
+
+fn record_discovery_worker_runtime(state: &AppState, sample: DiscoveryWorkerRuntimeSample) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
         let trigger_type = runtime.discovery_last_trigger_type.clone().or_else(|| {
             if runtime.discovery_event_trigger_count > runtime.discovery_timer_trigger_count {
@@ -2480,20 +2534,28 @@ fn record_discovery_worker_runtime(
                 None
             }
         });
-        runtime.discovery_last_elapsed_ms = elapsed_ms;
-        runtime.discovery_last_success_count = success_count;
-        runtime.discovery_last_failed_count = failed_count;
-        if success_count > 0 || failed_count > 0 {
-            runtime.discovery_last_progress_elapsed_ms = elapsed_ms;
-            runtime.discovery_last_progress_success_count = success_count;
-            runtime.discovery_last_progress_failed_count = failed_count;
+        runtime.discovery_last_elapsed_ms = sample.elapsed_ms;
+        runtime.discovery_last_success_count = sample.success_count;
+        runtime.discovery_last_failed_count = sample.failed_count;
+        if sample.success_count > 0 || sample.failed_count > 0 {
+            runtime.discovery_last_progress_elapsed_ms = sample.elapsed_ms;
+            runtime.discovery_last_progress_success_count = sample.success_count;
+            runtime.discovery_last_progress_failed_count = sample.failed_count;
             runtime.discovery_last_progress_trigger_type = trigger_type;
         }
-        runtime.discovery_last_claim_elapsed_ms = stage_metrics.claim_elapsed_ms;
-        runtime.discovery_last_prepare_elapsed_ms = stage_metrics.prepare_elapsed_ms;
-        runtime.discovery_last_notify_elapsed_ms = stage_metrics.notify_elapsed_ms;
-        runtime.discovery_effective_batch_size = batch_size;
-        runtime.discovery_effective_concurrency = concurrency;
+        runtime.discovery_last_claim_elapsed_ms = sample.stage_metrics.claim_elapsed_ms;
+        runtime.discovery_last_prepare_elapsed_ms = sample.stage_metrics.prepare_elapsed_ms;
+        runtime.discovery_last_notify_elapsed_ms = sample.stage_metrics.notify_elapsed_ms;
+        runtime.discovery_effective_batch_size = sample.batch_size;
+        runtime.discovery_effective_item_batch_size = sample.outcome_metrics.item_batch_size;
+        runtime.discovery_effective_concurrency = sample.concurrency;
+        runtime.discovery_last_claimed_target_count = sample.outcome_metrics.claimed_target_count;
+        runtime.discovery_last_carry_forward_count = sample.outcome_metrics.carry_forward_count;
+        runtime.discovery_last_ready_queue_depth_after =
+            sample.outcome_metrics.ready_queue_depth_after;
+        runtime.discovery_last_pending_queue_depth_after =
+            sample.outcome_metrics.pending_queue_depth_after;
+        runtime.discovery_last_claimed_cursor_lag = sample.outcome_metrics.claimed_cursor_lag;
         runtime.updated_at = Some(Utc::now());
     }
 }
@@ -2714,32 +2776,26 @@ fn record_worker_noop_cycle(state: &AppState, cdn_worker: bool) {
     }
 }
 
-fn record_mark_published_runtime(
-    state: &AppState,
-    job_count: usize,
-    fetch_elapsed_ms: u128,
-    fetch_sql_elapsed_ms: u128,
-    watermark_match_elapsed_ms: u128,
-    update_elapsed_ms: u128,
-    watermark_elapsed_ms: u128,
-    store_items_elapsed_ms: u128,
-    upsert_targets_elapsed_ms: u128,
-    delete_jobs_elapsed_ms: u128,
-    total_elapsed_ms: u128,
-) {
+fn record_mark_published_runtime(state: &AppState, sample: MarkPublishedRuntimeSample) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
-        runtime.mark_published_last_job_count = job_count;
-        runtime.mark_published_last_fetch_elapsed_ms = fetch_elapsed_ms;
-        runtime.mark_published_last_fetch_sql_elapsed_ms = fetch_sql_elapsed_ms;
-        runtime.mark_published_last_watermark_match_elapsed_ms = watermark_match_elapsed_ms;
-        runtime.mark_published_last_update_elapsed_ms = update_elapsed_ms;
-        runtime.mark_published_last_watermark_elapsed_ms = watermark_elapsed_ms;
-        runtime.mark_published_last_store_items_elapsed_ms = store_items_elapsed_ms;
-        runtime.mark_published_last_upsert_targets_elapsed_ms = upsert_targets_elapsed_ms;
-        runtime.mark_published_last_delete_jobs_elapsed_ms = delete_jobs_elapsed_ms;
-        runtime.mark_published_last_total_elapsed_ms = total_elapsed_ms;
+        runtime.mark_published_last_job_count = sample.job_count;
+        runtime.mark_published_last_fetch_elapsed_ms = sample.fetch_elapsed_ms;
+        runtime.mark_published_last_fetch_sql_elapsed_ms = sample.fetch_sql_elapsed_ms;
+        runtime.mark_published_last_watermark_match_elapsed_ms = sample.watermark_match_elapsed_ms;
+        runtime.mark_published_last_update_elapsed_ms = sample.update_elapsed_ms;
+        runtime.mark_published_last_watermark_elapsed_ms = sample.watermark_elapsed_ms;
+        runtime.mark_published_last_store_items_elapsed_ms = sample.store_items_elapsed_ms;
+        runtime.mark_published_last_upsert_targets_elapsed_ms = sample.upsert_targets_elapsed_ms;
+        runtime.mark_published_last_delete_jobs_elapsed_ms = sample.delete_jobs_elapsed_ms;
+        runtime.mark_published_last_total_elapsed_ms = sample.total_elapsed_ms;
         runtime.mark_published_total_call_count =
             runtime.mark_published_total_call_count.saturating_add(1);
+        runtime.mark_published_max_update_elapsed_ms = runtime
+            .mark_published_max_update_elapsed_ms
+            .max(sample.update_elapsed_ms);
+        runtime.mark_published_max_total_elapsed_ms = runtime
+            .mark_published_max_total_elapsed_ms
+            .max(sample.total_elapsed_ms);
         runtime.updated_at = Some(Utc::now());
     }
 }
@@ -3182,16 +3238,18 @@ async fn api_mark_cdn_publication_jobs_published(
     let total_elapsed_ms = started.elapsed().as_millis();
     record_mark_published_runtime(
         &state,
-        completion.marked_count,
-        completion.fetch_elapsed_ms,
-        completion.fetch_sql_elapsed_ms,
-        completion.watermark_match_elapsed_ms,
-        completion.update_elapsed_ms,
-        completion.watermark_elapsed_ms,
-        completion.store_items_elapsed_ms,
-        completion.upsert_targets_elapsed_ms,
-        completion.delete_jobs_elapsed_ms,
-        total_elapsed_ms,
+        MarkPublishedRuntimeSample {
+            job_count: completion.marked_count,
+            fetch_elapsed_ms: completion.fetch_elapsed_ms,
+            fetch_sql_elapsed_ms: completion.fetch_sql_elapsed_ms,
+            watermark_match_elapsed_ms: completion.watermark_match_elapsed_ms,
+            update_elapsed_ms: completion.update_elapsed_ms,
+            watermark_elapsed_ms: completion.watermark_elapsed_ms,
+            store_items_elapsed_ms: completion.store_items_elapsed_ms,
+            upsert_targets_elapsed_ms: completion.upsert_targets_elapsed_ms,
+            delete_jobs_elapsed_ms: completion.delete_jobs_elapsed_ms,
+            total_elapsed_ms,
+        },
     );
     if completion.advanced_discovery_count > 0 {
         signal_worker_event(&state, false);
@@ -4284,6 +4342,7 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
         state.config.security.workers.lease_seconds,
     )
     .await?;
+    let claimed = order_cdn_outbox_claims_by_publication_cursor(claimed);
     let claim_elapsed_ms = claim_started.elapsed().as_millis();
     let attempted_count = claimed.len();
     let concurrency = state.config.security.workers.cdn_concurrency.max(1);
@@ -4376,6 +4435,17 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
     }))
 }
 
+fn order_cdn_outbox_claims_by_publication_cursor(
+    mut claimed: Vec<(String, CdnPublishRequestedEvent)>,
+) -> Vec<(String, CdnPublishRequestedEvent)> {
+    claimed.sort_by(|a, b| {
+        a.1.publication_cursor
+            .cmp(&b.1.publication_cursor)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    claimed
+}
+
 fn discovery_sync_url(auth: &DiscoveryAuthorizationState) -> Result<String> {
     let did_document = auth
         .did_document_snapshot
@@ -4424,7 +4494,14 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
     let authorization_state = current_authorization_state(state);
     let mut notified = Vec::new();
     let mut failed = Vec::<Value>::new();
+    let mut carry_forward_count = 0usize;
     let concurrency = state.config.security.workers.discovery_concurrency.max(1);
+    let discovery_item_batch_size = effective_discovery_target_item_batch_size(
+        state.config.security.workers.discovery_batch_size,
+        claimed_count,
+        concurrency,
+        claimed_cursor_lag,
+    );
     let mut in_flight = JoinSet::new();
     let mut target_iter = targets.into_iter();
     let notify_started = std::time::Instant::now();
@@ -4505,7 +4582,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                     lease.target_cursor,
                 )
                 .await?;
-                let max_items = state.config.security.workers.discovery_batch_size.max(1);
+                let max_items = discovery_item_batch_size.max(1);
                 if summary_items.len() > max_items {
                     summary_items.truncate(max_items);
                 }
@@ -4550,8 +4627,11 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 delivered_cursor,
                             )
                             .await?;
+                            if delivered_cursor < lease.target_cursor {
+                                signal_worker_event(&state, false);
+                            }
                         }
-                        if rejected_count > 0 || cursor_lag > 0 || delivered_cursor < batch_target_cursor {
+                        if rejected_count > 0 {
                             let error = format!(
                                 "discovery_partial_sync:delivered={delivered_cursor}:target={}:rejected={rejected_count}:cursorLag={cursor_lag}",
                                 batch_target_cursor
@@ -4574,6 +4654,24 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 "createdAt": Utc::now()
                             }));
                         }
+                        if cursor_lag > 0 || delivered_cursor < batch_target_cursor {
+                            return Ok(json!({
+                                "kind": "notified",
+                                "rootDid": state.root_did,
+                                "targetDiscoveryDid": lease.discovery_did,
+                                "authorizedDomains": auth.authorized_domains,
+                                "itemCount": summary_items.len(),
+                                "deliveredCursor": delivered_cursor,
+                                "targetCursor": batch_target_cursor,
+                                "pendingTargetCursor": lease.target_cursor,
+                                "remainingCursorLag": lease.target_cursor.saturating_sub(delivered_cursor),
+                                "previousDeliveredCursor": lease.delivered_cursor,
+                                "syncUrl": sync_url,
+                                "syncResult": response_body,
+                                "partialProgress": true,
+                                "createdAt": Utc::now()
+                            }));
+                        }
                         Ok(json!({
                             "kind": "notified",
                             "rootDid": state.root_did,
@@ -4583,6 +4681,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                             "deliveredCursor": delivered_cursor,
                             "targetCursor": batch_target_cursor,
                             "pendingTargetCursor": lease.target_cursor,
+                            "remainingCursorLag": lease.target_cursor.saturating_sub(delivered_cursor),
                             "previousDeliveredCursor": lease.delivered_cursor,
                             "syncUrl": sync_url,
                             "syncResult": response_body,
@@ -4624,7 +4723,12 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
             break;
         };
         match joined {
-            Ok(Ok(result)) if result["kind"] == "notified" => notified.push(result),
+            Ok(Ok(result)) if result["kind"] == "notified" => {
+                if result["remainingCursorLag"].as_i64().unwrap_or(0) > 0 {
+                    carry_forward_count = carry_forward_count.saturating_add(1);
+                }
+                notified.push(result)
+            }
             Ok(Ok(result)) => failed.push(result),
             Ok(Err(err)) => failed.push(json!({ "error": err.to_string() })),
             Err(err) => failed.push(json!({ "error": err.to_string() })),
@@ -4636,19 +4740,29 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
     let (ready_depth_after, pending_depth_after) = discovery_queue_depths(state).await?;
     record_discovery_worker_runtime(
         state,
-        elapsed_ms,
-        notified.len(),
-        failed.len(),
-        effective_worker_batch_size(
-            state.config.security.workers.discovery_batch_size,
-            ready_depth_before,
-            2,
-        ),
-        concurrency,
-        DiscoveryWorkerStageMetrics {
-            claim_elapsed_ms,
-            prepare_elapsed_ms,
-            notify_elapsed_ms,
+        DiscoveryWorkerRuntimeSample {
+            elapsed_ms,
+            success_count: notified.len(),
+            failed_count: failed.len(),
+            batch_size: effective_worker_batch_size(
+                state.config.security.workers.discovery_batch_size,
+                ready_depth_before,
+                2,
+            ),
+            concurrency,
+            stage_metrics: DiscoveryWorkerStageMetrics {
+                claim_elapsed_ms,
+                prepare_elapsed_ms,
+                notify_elapsed_ms,
+            },
+            outcome_metrics: DiscoveryWorkerOutcomeMetrics {
+                claimed_target_count: claimed_count,
+                carry_forward_count,
+                ready_queue_depth_after: ready_depth_after,
+                pending_queue_depth_after: pending_depth_after,
+                claimed_cursor_lag,
+                item_batch_size: discovery_item_batch_size,
+            },
         },
     );
     let result = json!({
@@ -4659,12 +4773,14 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
         "successCount": notified.len(),
         "notifiedCount": notified.len(),
         "failedCount": failed.len(),
+        "carryForwardCount": carry_forward_count,
         "claimElapsedMs": claim_elapsed_ms,
         "prepareElapsedMs": prepare_elapsed_ms,
         "notifyElapsedMs": notify_elapsed_ms,
         "elapsedMs": elapsed_ms,
         "drainRatePerSec": drain_rate_per_sec(notified.len(), elapsed_ms),
         "claimedCursorLag": claimed_cursor_lag,
+        "itemBatchSize": discovery_item_batch_size,
         "concurrency": concurrency,
         "readyQueueDepthBefore": ready_depth_before,
         "pendingQueueDepthBefore": pending_depth_before,
@@ -4707,15 +4823,9 @@ fn cdn_cycle_made_progress(result: &Value) -> bool {
 
 fn cdn_cycle_should_continue_immediately(result: &Value) -> bool {
     let ready_after = value_u64(result, "readyQueueDepthAfter");
-    let active_after = value_u64(result, "activeQueueDepthAfter");
     let attempted = value_u64(result, "attemptedCount");
-    let published = value_u64(result, "publishedCount");
-    let failed = value_u64(result, "failedCount");
-    let marked_retry = value_u64(result, "markedRetryCount");
-    let marked_published = value_u64(result, "markedPublishedCount");
-    let backlog_remains = ready_after > 0 || active_after > 0;
-    ((published > 0 || failed > 0 || marked_published > 0 || marked_retry > 0) && backlog_remains)
-        || (attempted > 0 && ready_after > 0)
+    let effective_batch_size = value_u64(result, "effectiveBatchSize");
+    ready_after > 0 || (effective_batch_size > 0 && attempted >= effective_batch_size)
 }
 
 fn discovery_cycle_made_progress(result: &Value) -> bool {
@@ -4724,12 +4834,12 @@ fn discovery_cycle_made_progress(result: &Value) -> bool {
 
 fn discovery_cycle_should_continue_immediately(result: &Value) -> bool {
     let ready_after = value_u64(result, "readyQueueDepthAfter");
-    let pending_after = value_u64(result, "pendingQueueDepthAfter");
     let claimed_targets = value_u64(result, "claimedTargetCount");
-    let success = value_u64(result, "successCount");
-    let failures = value_u64(result, "failedCount");
-    let backlog_remains = ready_after > 0 || pending_after > 0;
-    (backlog_remains && (success > 0 || failures > 0)) || (claimed_targets > 0 && ready_after > 0)
+    let effective_batch_size = value_u64(result, "effectiveBatchSize");
+    let carry_forward_count = value_u64(result, "carryForwardCount");
+    ready_after > 0
+        || carry_forward_count > 0
+        || (effective_batch_size > 0 && claimed_targets >= effective_batch_size)
 }
 
 async fn cdn_queue_depths(state: &AppState) -> Result<(usize, usize)> {
