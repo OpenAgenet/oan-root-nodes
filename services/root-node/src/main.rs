@@ -208,8 +208,8 @@ struct TrustIndexerConfig {
 impl Default for TrustIndexerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            endpoint: None,
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:8088".to_owned()),
             fail_mode: default_trust_indexer_fail_mode(),
             timeout_ms: default_trust_indexer_timeout_ms(),
             poll_interval_ms: default_trust_indexer_poll_interval_ms(),
@@ -740,7 +740,7 @@ struct InfrastructureAuthorizationCredentialSubject {
     subject_type: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
-    #[serde(rename = "authorizedDomains", default)]
+    #[serde(rename = "authorizedDomains", alias = "authorized_domains", default)]
     authorized_domains: Vec<String>,
     #[serde(rename = "didDocumentFile")]
     did_document_file: String,
@@ -850,6 +850,8 @@ struct NodeAuthorizationState {
         skip_serializing_if = "Option::is_none"
     )]
     did_document_snapshot: Option<DidDocument>,
+    #[serde(rename = "authorizedDomains", alias = "authorized_domains", default)]
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -862,6 +864,7 @@ struct DiscoveryAuthorizationState {
         skip_serializing_if = "Option::is_none"
     )]
     did_document_snapshot: Option<DidDocument>,
+    #[serde(alias = "authorizedDomains", default)]
     authorized_domains: Vec<String>,
     tag_tree_version: u64,
 }
@@ -992,6 +995,8 @@ struct DiscoveryNotificationItem {
     resource_type: String,
     #[serde(rename = "capabilityTags")]
     capability_tags: Vec<String>,
+    #[serde(rename = "authorizedDomains", default)]
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1013,8 +1018,7 @@ async fn main() -> Result<()> {
         crypto_suite,
         &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
     )?;
-    let authorization_state =
-        load_authorization_state(&config.paths.authorization_state_file).unwrap_or_default();
+    let authorization_state = load_authorization_state(&config.paths.authorization_state_file)?;
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
         Some(url) if !url.is_empty() => {
             let database = DatabaseConfig::parse(url)?;
@@ -1615,7 +1619,10 @@ fn validate_governance_subject_binding(
     if chain_hash != did_document_stable_hash {
         return Err("governance_subject_metadata_hash_mismatch".to_owned());
     }
-    if subject_type == GovernanceSubjectType::Discovery {
+    if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) {
         let mut payload_domains = payload.authorized_domains.clone();
         let mut chain_domains = subject.authorized_domains.clone();
         payload_domains.sort();
@@ -1823,11 +1830,21 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 did_document_hash TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 capability_tags_json TEXT NOT NULL,
+                authorized_domains_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
             "#
         ))
         .await?;
+    sqlite
+        .execute_batch(&format!(
+            r#"
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';
+            "#
+        ))
+        .await
+        .ok();
     sqlite.ensure_leased_job_table(ROOT_CDN_JOB_TABLE).await?;
     sqlite
         .ensure_leased_job_table(ROOT_CDN_OUTBOX_TABLE)
@@ -1904,6 +1921,7 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 did_document_hash TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 capability_tags_json JSONB NOT NULL,
+                authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
             CREATE INDEX IF NOT EXISTS idx_root_subject_versions_subject_version
@@ -1941,6 +1959,8 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT 'unknown';
             ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
                 ADD COLUMN IF NOT EXISTS capability_tags_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb;
             ALTER TABLE {ROOT_CDN_JOB_TABLE}
                 ADD COLUMN IF NOT EXISTS publication_cursor BIGINT;
             ALTER TABLE {ROOT_CDN_JOB_TABLE}
@@ -1957,6 +1977,10 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 ADD COLUMN IF NOT EXISTS resource_type TEXT;
             ALTER TABLE {ROOT_CDN_JOB_TABLE}
                 ADD COLUMN IF NOT EXISTS capability_tags_json JSONB;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb;
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_job_projection
             ON {ROOT_CDN_JOB_TABLE}(job_key, publication_cursor);
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_ready_projection
@@ -2030,9 +2054,16 @@ async fn verify_resource_and_publish(
     )
     .await
     .map_err(ApiError::forbidden)?;
+    let registrar_entry = load_authorized_registrar_entry(&state, &request.registrar_did)
+        .map_err(ApiError::forbidden)?;
 
     let mut metadata = build_resource_metadata(&request.submission)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    validate_resource_authorized_domains(
+        &metadata.authorized_domains,
+        &registrar_entry.authorized_domains,
+    )
+    .map_err(ApiError::bad_request)?;
     let root_suite = state.signing_key.crypto_suite();
     let did_document_hash =
         hash_json_with_suite(root_suite.clone(), &request.submission.did_document)
@@ -2077,6 +2108,7 @@ async fn verify_resource_and_publish(
         package_hash: request.submission.package_hash.clone(),
         hash_algorithm: request.submission.hash_algorithm.clone(),
         lifecycle_state: metadata.lifecycle_state.clone(),
+        authorized_domains: metadata.authorized_domains.clone(),
         bulletin_ref: metadata
             .protocol_bindings
             .iter()
@@ -2168,6 +2200,12 @@ async fn authorize_registrar(
         }),
     )
     .map_err(ApiError::internal)?;
+    let authorized_domains = request
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
     update_authorization_state(
         &state,
         &request.target_did,
@@ -2176,6 +2214,7 @@ async fn authorize_registrar(
             updated_at: Utc::now(),
             did_document_hash,
             did_document_snapshot: Some(request.did_document),
+            authorized_domains,
         },
         &request.target_role,
         None,
@@ -2285,6 +2324,11 @@ async fn issue_infrastructure_authorization_vc(
                     updated_at: Utc::now(),
                     did_document_hash: did_document_hash.clone(),
                     did_document_snapshot: Some(request.payload.did_document.clone()),
+                    authorized_domains: if subject_type == GovernanceSubjectType::Registrar {
+                        request.payload.authorized_domains.clone()
+                    } else {
+                        Vec::new()
+                    },
                 },
                 subject_type.label(),
                 None,
@@ -3007,7 +3051,15 @@ async fn api_registrars(State(state): State<AppState>) -> ApiResult<Value> {
     let items: Vec<Value> = authorization_state
         .registrars
         .into_iter()
-        .map(|(did, entry)| json!({ "did": did, "status": entry.status, "didDocumentHash": entry.did_document_hash, "updatedAt": entry.updated_at }))
+        .map(|(did, entry)| {
+            json!({
+                "did": did,
+                "status": entry.status,
+                "didDocumentHash": entry.did_document_hash,
+                "authorizedDomains": entry.authorized_domains,
+                "updatedAt": entry.updated_at
+            })
+        })
         .collect();
     let items = if items.is_empty() {
         let bulletin = read_bulletin(&state).map_err(ApiError::internal)?;
@@ -3116,7 +3168,7 @@ async fn api_discovery_detail(
                 )
         })
         .map(|event| event.core.payload.clone())
-        .unwrap_or_else(|| json!({"authorizedDomains": ["*"]}));
+        .unwrap_or_else(|| json!({"authorizedDomains": []}));
     Ok(Json(json!({
         "did": did,
         "status": latest_node_status(&bulletin, &did),
@@ -3413,6 +3465,69 @@ fn load_authorized_registrar_document(state: &AppState, did: &str) -> Result<Did
         .ok_or_else(|| anyhow!("authorized_registrar_document_missing"))
 }
 
+fn validate_authorized_domain_list(domains: &[String]) -> std::result::Result<(), String> {
+    if domains.iter().any(|domain| domain == "*") {
+        return if domains.len() == 1 {
+            Ok(())
+        } else {
+            Err("invalid_authorized_domains".to_owned())
+        };
+    }
+    for domain in domains {
+        if domain.trim().is_empty()
+            || domain != domain.trim()
+            || domain.contains("..")
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+        {
+            return Err("invalid_authorized_domains".to_owned());
+        }
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("invalid_authorized_domains".to_owned());
+    }
+    Ok(())
+}
+
+fn authorized_domain_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || requested
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn authorized_domains_cover(granted: &[String], requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    if granted.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if granted.is_empty() {
+        return false;
+    }
+    requested.iter().all(|requested_domain| {
+        granted
+            .iter()
+            .any(|granted_domain| authorized_domain_covers(granted_domain, requested_domain))
+    })
+}
+
+fn validate_resource_authorized_domains(
+    resource_domains: &[String],
+    registrar_domains: &[String],
+) -> std::result::Result<(), String> {
+    if resource_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(resource_domains)?;
+    validate_authorized_domain_list(registrar_domains)?;
+    if !authorized_domains_cover(registrar_domains, resource_domains) {
+        return Err("unauthorized_domains".to_owned());
+    }
+    Ok(())
+}
+
 fn governance_subject_type_for_role(
     role: &str,
 ) -> std::result::Result<GovernanceSubjectType, String> {
@@ -3472,10 +3587,17 @@ async fn validate_authorization_vc_issue_request(
         Utc::now(),
     )
     .map_err(|err| err.to_string())?;
-    if subject_type == GovernanceSubjectType::Discovery
-        && request.payload.authorized_domains.is_empty()
+    if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) && request.payload.authorized_domains.is_empty()
     {
-        return Err("discovery_authorized_domains_required".to_owned());
+        return Err("infrastructure_authorized_domains_required".to_owned());
+    }
+    if subject_type == GovernanceSubjectType::VcIssuer
+        && !request.payload.authorized_domains.is_empty()
+    {
+        return Err("vc_issuer_authorized_domains_forbidden".to_owned());
     }
     if let Some(claimed_hash) =
         did_document_chain_governance_stable_hash(&request.payload.did_document)
@@ -3596,19 +3718,11 @@ fn validate_infrastructure_did_document_profile(
             return Err("did_document_endpoint_mismatch".to_owned());
         }
     }
-    if subject_type == GovernanceSubjectType::Discovery {
-        let metadata_domains = metadata
-            .extra
-            .get("authorizedDomains")
-            .and_then(Value::as_array)
-            .map(|domains| {
-                domains
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) {
+        let metadata_domains = metadata.authorized_domains.clone();
         let mut request_domains = payload.authorized_domains.clone();
         let mut metadata_domains_sorted = metadata_domains;
         request_domains.sort();
@@ -3820,6 +3934,18 @@ fn build_resource_metadata(
             .map(|value| value.capability_tags.clone())
             .unwrap_or_default()
     };
+    let authorized_domains = if let Some(domains) = metadata_value["authorizedDomains"].as_array() {
+        let domains = domains
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        if domains != oan_metadata.authorized_domains {
+            return Err(anyhow!("authorized_domains_mismatch"));
+        }
+        domains
+    } else {
+        oan_metadata.authorized_domains.clone()
+    };
     let lifecycle_state = metadata_value["lifecycleState"]
         .as_str()
         .unwrap_or_else(|| oan_metadata.lifecycle_state.as_deref().unwrap_or("active"))
@@ -3837,6 +3963,7 @@ fn build_resource_metadata(
         name,
         description: description_text,
         capability_tags,
+        authorized_domains,
         protocol_bindings: oan_metadata
             .protocol_bindings
             .iter()
