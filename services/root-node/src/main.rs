@@ -1789,6 +1789,7 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS {ROOT_SUBJECT_VERSION_TABLE} (
+                publication_cursor INTEGER UNIQUE,
                 subject_did TEXT NOT NULL,
                 version TEXT NOT NULL,
                 did_document_hash TEXT NOT NULL,
@@ -1839,6 +1840,8 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
     sqlite
         .execute_batch(&format!(
             r#"
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN publication_cursor INTEGER;
             ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
                 ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';
             "#
@@ -4723,7 +4726,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                     .client
                     .post(&sync_url)
                     .json(&json!({
-                        "maxPublications": state.config.security.workers.discovery_batch_size,
+                        "maxPublications": max_items,
                         "cursorHint": batch_target_cursor,
                         "items": summary_items
                     }))
