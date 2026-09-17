@@ -1659,7 +1659,13 @@ fn mark_local_governance_inactive(
     did: &str,
     reason: &str,
 ) -> Result<()> {
-    if reason.starts_with("trust_indexer_unavailable_fail_open") {
+    if reason.starts_with("trust_indexer_unavailable") {
+        eprintln!(
+            "skip marking {} {} as governance_inactive because Trust Indexer is unavailable: {}",
+            subject_type.label(),
+            did,
+            reason
+        );
         return Ok(());
     }
     let mut authorization_state = current_authorization_state(state);
@@ -1692,10 +1698,7 @@ fn mark_local_governance_inactive(
             }
         }
     }
-    JsonStore::new(".").write(
-        &state.config.paths.authorization_state_file,
-        &authorization_state,
-    )?;
+    persist_authorization_state(state, authorization_state)?;
     eprintln!(
         "marked {} {} as governance_inactive: {}",
         subject_type.label(),
@@ -1745,10 +1748,7 @@ fn restore_local_governance_active(
         }
     }
     if changed {
-        JsonStore::new(".").write(
-            &state.config.paths.authorization_state_file,
-            &authorization_state,
-        )?;
+        persist_authorization_state(state, authorization_state)?;
     }
     Ok(())
 }
