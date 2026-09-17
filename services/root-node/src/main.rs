@@ -28,13 +28,15 @@ use oan_protocol::{
     HealthResponse, InfrastructureAuthorizationVcIssuePayload,
     InfrastructureAuthorizationVcIssueRequest, ResourceVerifyAndPublishRequest,
     RootAuthorizeRequest, PATH_ROOT_INFRASTRUCTURE_AUTHORIZATION_VCS_ISSUE,
-    PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_INFRASTRUCTURE_AUTHORIZATION_VC_ISSUE,
-    PURPOSE_VERIFY_AND_PUBLISH,
+    PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+    PURPOSE_INFRASTRUCTURE_AUTHORIZATION_VC_ISSUE, PURPOSE_VERIFY_AND_PUBLISH,
 };
 use oan_publication_events::{CdnPublishRequestedEvent, CdnPublishRequestedEventInput};
 use oan_service_security::{
-    bearer_token_from_header, request_id, verify_admin_token, verify_signed_request_envelope,
-    AdminAuthConfig, AdminAuthMode, AdminPrincipal, TrustedUpstreamPolicy,
+    bearer_token_from_header, request_id, verify_admin_token,
+    verify_controller_authorization_proof, verify_signed_request_envelope, AdminAuthConfig,
+    AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
+    TrustedUpstreamPolicy,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
@@ -2123,6 +2125,7 @@ async fn verify_resource_and_publish(
     if metadata_hash != request.submission.metadata_hash {
         return Err(ApiError::bad_request("metadata_hash_mismatch"));
     }
+    verify_controller_authorization_for_submission(&request).map_err(ApiError::bad_request)?;
     metadata.metadata_hash = metadata_hash.clone();
     metadata.package_hash = request.submission.package_hash.clone();
     let package_hash = hash_json_with_suite(
@@ -4123,6 +4126,54 @@ fn verify_resource_request(
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
     Ok(())
+}
+
+fn verify_controller_authorization_for_submission(
+    request: &ResourceVerifyAndPublishRequest,
+) -> std::result::Result<Option<String>, String> {
+    let submission = &request.submission;
+    let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(controller_did) = metadata.controller_did.as_deref() else {
+        return Ok(None);
+    };
+    if controller_did == submission.resource_did {
+        return Ok(None);
+    }
+    let Some(bundle) = submission.controller_authorization_proof.as_ref() else {
+        eprintln!(
+            "controller authorization proof missing at root for resource {} controlled by {}",
+            submission.resource_did, controller_did
+        );
+        return Err("controller_authorization_proof_required".to_owned());
+    };
+    let expected_publisher_did = metadata
+        .publisher_did
+        .as_deref()
+        .filter(|publisher_did| *publisher_did == controller_did);
+    verify_controller_authorization_proof(
+        bundle,
+        &ControllerAuthorizationVerificationContext {
+            expected_resource_did: &submission.resource_did,
+            expected_controller_did: controller_did,
+            expected_publisher_did,
+            expected_did_document_hash: &submission.did_document_hash,
+            expected_metadata_hash: &submission.metadata_hash,
+            expected_registrar_did: &request.registrar_did,
+            expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+            now: Utc::now(),
+        },
+    )
+    .map(Some)
+    .map_err(|err| {
+        let message = err.to_string();
+        eprintln!(
+            "controller authorization proof rejected at root for resource {} controlled by {}: {}",
+            submission.resource_did, controller_did, message
+        );
+        message
+    })
 }
 
 fn build_resource_metadata(
