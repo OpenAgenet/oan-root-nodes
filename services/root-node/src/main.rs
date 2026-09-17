@@ -13,7 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use oan_bulletin::{Bulletin, BulletinEvent, BulletinEventCore, BulletinEventType};
 use oan_core::{CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
 use oan_crypto::{
@@ -70,6 +70,7 @@ const ROOT_SUBJECT_VERSION_TABLE: &str = "root_subject_versions";
 const ROOT_PACKAGE_JOB_TABLE: &str = "root_verified_package_jobs";
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
 const ROOT_STATUS_CACHE_TTL_MS: u64 = 500;
+const FORUM_IDENTITY_DIRECTORY_ACCEPTED_AFTER: &str = "2026-09-14T16:00:00Z";
 
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
@@ -435,6 +436,42 @@ struct WorkerWakeState {
 struct CachedRootStatusCounts {
     captured_at: Instant,
     counts: RootStatusCounts,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ForumIdentityDirectoryItem {
+    did: String,
+    status: String,
+    #[serde(rename = "didDocumentHashes")]
+    did_document_hashes: Vec<String>,
+    #[serde(rename = "publicKeys")]
+    public_keys: Vec<ForumIdentityPublicKey>,
+    #[serde(rename = "resourceCount")]
+    resource_count: usize,
+    #[serde(rename = "resourceDids")]
+    resource_dids: Vec<String>,
+    #[serde(rename = "resourceTypes")]
+    resource_types: Vec<String>,
+    #[serde(rename = "nodeOperator")]
+    node_operator: bool,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ForumIdentityPublicKey {
+    id: String,
+    controller: String,
+    #[serde(rename = "publicKeyJwk", skip_serializing_if = "Option::is_none")]
+    public_key_jwk: Option<Value>,
+    #[serde(rename = "publicKeyMultibase", skip_serializing_if = "Option::is_none")]
+    public_key_multibase: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ForumResourcePackage {
+    package: ResourcePackage,
+    accepted_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1090,6 +1127,10 @@ async fn main() -> Result<()> {
         .route("/root/registrars/{did}", get(api_registrar_detail))
         .route("/root/discovery-nodes", get(api_discovery_nodes))
         .route("/root/discovery-nodes/{did}", get(api_discovery_detail))
+        .route(
+            "/root/forum/identity-directory",
+            get(api_forum_identity_directory),
+        )
         .route(
             "/root/infrastructure/authorization-vcs/issue",
             post(issue_infrastructure_authorization_vc),
@@ -3877,6 +3918,191 @@ async fn api_resource_detail(
         .read(format!("resource-packages/{}", did_to_file_name(&did)))
         .ok();
     Ok(Json(json!({ "resourceDid": did, "package": package })))
+}
+
+async fn api_forum_identity_directory(State(state): State<AppState>) -> ApiResult<Value> {
+    let packages = latest_forum_resource_packages(&state)
+        .await
+        .map_err(ApiError::internal)?;
+    let generated_at = Utc::now().to_rfc3339();
+    let accepted_after = forum_identity_directory_cutoff();
+    let mut identities = BTreeMap::<String, ForumIdentityDirectoryItem>::new();
+
+    for forum_package in packages
+        .into_iter()
+        .filter(|item| item.accepted_at >= accepted_after)
+    {
+        let package = forum_package.package;
+        let Some(identity_did) = forum_identity_did_for_package(&package) else {
+            continue;
+        };
+        let entry =
+            identities
+                .entry(identity_did.clone())
+                .or_insert_with(|| ForumIdentityDirectoryItem {
+                    did: identity_did.clone(),
+                    status: "active".to_owned(),
+                    did_document_hashes: Vec::new(),
+                    public_keys: Vec::new(),
+                    resource_count: 0,
+                    resource_dids: Vec::new(),
+                    resource_types: Vec::new(),
+                    node_operator: false,
+                    updated_at: generated_at.clone(),
+                });
+
+        entry.resource_count += 1;
+        push_unique(&mut entry.resource_dids, package.resource_did.clone());
+        push_unique(
+            &mut entry.resource_types,
+            serde_json::to_value(&package.resource_type)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned()),
+        );
+        push_unique(
+            &mut entry.did_document_hashes,
+            package.did_document_hash.clone(),
+        );
+        entry.node_operator |= package.resource_type == ResourceType::InfrastructureNode;
+        if package.did_document.id == identity_did {
+            for key in forum_public_keys_for_document(&package.did_document) {
+                if !entry.public_keys.iter().any(|item| item.id == key.id) {
+                    entry.public_keys.push(key);
+                }
+            }
+        }
+    }
+
+    let items = identities.into_values().collect::<Vec<_>>();
+    Ok(Json(json!({
+        "version": "1.0",
+        "rootDid": state.root_did,
+        "generatedAt": generated_at,
+        "sourceVersion": generated_at,
+        "acceptedAfter": accepted_after.to_rfc3339(),
+        "nextCursor": null,
+        "items": items,
+    })))
+}
+
+async fn latest_forum_resource_packages(state: &AppState) -> Result<Vec<ForumResourcePackage>> {
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT versions.package_json, versions.accepted_at
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            ORDER BY latest.subject_did
+            "#
+        ))
+        .fetch_all(sqlite.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
+                let accepted_at = parse_forum_identity_timestamp(&row.get::<String, _>(1))?;
+                Ok(ForumResourcePackage {
+                    package,
+                    accepted_at,
+                })
+            })
+            .collect();
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT versions.package_json::text,
+                   to_char(versions.accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            ORDER BY latest.subject_did
+            "#
+        ))
+        .fetch_all(postgres.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
+                let accepted_at = parse_forum_identity_timestamp(&row.get::<String, _>(1))?;
+                Ok(ForumResourcePackage {
+                    package,
+                    accepted_at,
+                })
+            })
+            .collect();
+    }
+    Ok(Vec::new())
+}
+
+fn forum_identity_directory_cutoff() -> DateTime<Utc> {
+    parse_forum_identity_timestamp(FORUM_IDENTITY_DIRECTORY_ACCEPTED_AFTER)
+        .expect("forum identity directory cutoff must be a valid RFC3339 timestamp")
+}
+
+fn parse_forum_identity_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
+}
+
+fn forum_identity_did_for_package(package: &ResourcePackage) -> Option<String> {
+    package
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .controller_did
+                .as_deref()
+                .or(metadata.publisher_did.as_deref())
+        })
+        .filter(|did| did.starts_with("did:oan:"))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            package
+                .metadata
+                .subject_did
+                .as_ref()
+                .filter(|did| did.starts_with("did:oan:"))
+                .cloned()
+        })
+        .or_else(|| {
+            package
+                .resource_did
+                .starts_with("did:oan:")
+                .then(|| package.resource_did.clone())
+        })
+}
+
+fn forum_public_keys_for_document(document: &DidDocument) -> Vec<ForumIdentityPublicKey> {
+    document
+        .verification_method
+        .iter()
+        .filter(|method| {
+            document
+                .authentication
+                .iter()
+                .any(|item| item == &method.id)
+                || method.controller == document.id
+        })
+        .map(|method| ForumIdentityPublicKey {
+            id: method.id.clone(),
+            controller: method.controller.clone(),
+            public_key_jwk: method.public_key_jwk.clone(),
+            public_key_multibase: method.public_key_multibase.clone(),
+        })
+        .collect()
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|item| item == &value) {
+        items.push(value);
+    }
 }
 
 fn verify_resource_request(
