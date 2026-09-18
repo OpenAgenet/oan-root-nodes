@@ -32,6 +32,8 @@ use std::{
 use tokio::{task::JoinSet, time::Duration as TokioDuration};
 use url::Url;
 
+const ROOT_BATCH_MAX_JOBS: usize = 100;
+
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
     server: ServerConfig,
@@ -1143,56 +1145,58 @@ async fn fetch_resource_packages_batch(
         &state.config.root.endpoint,
         &state.config.root.package_batch_path,
     )?;
-    let jobs = events
-        .iter()
-        .map(|event| {
-            json!({
-                "jobKey": event.job_key
-            })
-        })
-        .collect::<Vec<_>>();
-    let response = state
-        .client
-        .post(url)
-        .bearer_auth(admin_token)
-        .json(&json!({ "jobs": jobs }))
-        .send()
-        .await?;
-    let status = response.status();
-    let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(anyhow!("root_package_batch_failed:{status}:{value}"));
-    }
-    let items = serde_json::from_value::<Vec<RootBatchPackageItem>>(
-        value
-            .get("items")
-            .cloned()
-            .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?,
-    )?;
     let mut packages = BTreeMap::new();
-    for item in items {
-        if item.job_key.trim().is_empty() {
-            return Err(anyhow!("root_package_batch_job_key_missing"));
+    for chunk in events.chunks(ROOT_BATCH_MAX_JOBS) {
+        let jobs = chunk
+            .iter()
+            .map(|event| {
+                json!({
+                    "jobKey": event.job_key
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = state
+            .client
+            .post(url.clone())
+            .bearer_auth(admin_token)
+            .json(&json!({ "jobs": jobs }))
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            return Err(anyhow!("root_package_batch_failed:{status}:{value}"));
         }
-        if item.publication_cursor <= 0 {
-            return Err(anyhow!("root_package_batch_cursor_missing"));
+        let items = serde_json::from_value::<Vec<RootBatchPackageItem>>(
+            value
+                .get("items")
+                .cloned()
+                .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?,
+        )?;
+        for item in items {
+            if item.job_key.trim().is_empty() {
+                return Err(anyhow!("root_package_batch_job_key_missing"));
+            }
+            if item.publication_cursor <= 0 {
+                return Err(anyhow!("root_package_batch_cursor_missing"));
+            }
+            if item.resource_did != item.package.resource_did {
+                return Err(anyhow!("root_package_batch_resource_did_mismatch"));
+            }
+            if item.package_version != item.package.package_version {
+                return Err(anyhow!("root_package_batch_package_version_mismatch"));
+            }
+            if item.package_hash != item.package.package_hash {
+                return Err(anyhow!("root_package_batch_package_hash_mismatch"));
+            }
+            if item.did_document_hash != item.package.did_document_hash {
+                return Err(anyhow!("root_package_batch_did_document_hash_mismatch"));
+            }
+            if item.metadata_hash != item.package.metadata_hash {
+                return Err(anyhow!("root_package_batch_metadata_hash_mismatch"));
+            }
+            packages.insert(item.job_key, (item.publication_cursor, item.package));
         }
-        if item.resource_did != item.package.resource_did {
-            return Err(anyhow!("root_package_batch_resource_did_mismatch"));
-        }
-        if item.package_version != item.package.package_version {
-            return Err(anyhow!("root_package_batch_package_version_mismatch"));
-        }
-        if item.package_hash != item.package.package_hash {
-            return Err(anyhow!("root_package_batch_package_hash_mismatch"));
-        }
-        if item.did_document_hash != item.package.did_document_hash {
-            return Err(anyhow!("root_package_batch_did_document_hash_mismatch"));
-        }
-        if item.metadata_hash != item.package.metadata_hash {
-            return Err(anyhow!("root_package_batch_metadata_hash_mismatch"));
-        }
-        packages.insert(item.job_key, (item.publication_cursor, item.package));
     }
     Ok(packages)
 }
@@ -1285,17 +1289,19 @@ async fn mark_root_jobs_published(
         &state.config.root.mark_published_path,
     )?;
     let jobs = build_mark_published_jobs(items);
-    let response = state
-        .client
-        .post(url)
-        .bearer_auth(admin_token)
-        .json(&json!({ "jobs": jobs }))
-        .send()
-        .await?;
-    let status = response.status();
-    let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(anyhow!("root_mark_published_failed:{status}:{value}"));
+    for chunk in jobs.chunks(ROOT_BATCH_MAX_JOBS) {
+        let response = state
+            .client
+            .post(url.clone())
+            .bearer_auth(admin_token)
+            .json(&json!({ "jobs": chunk }))
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            return Err(anyhow!("root_mark_published_failed:{status}:{value}"));
+        }
     }
     Ok(())
 }
