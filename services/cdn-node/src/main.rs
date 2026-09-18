@@ -794,11 +794,8 @@ async fn api_resources_catalog(
     State(state): State<AppState>,
     Query(query): Query<ResourceIndexQuery>,
 ) -> ApiResult<serde_json::Value> {
+    let limit = validated_resource_index_limit(query.limit)?;
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
-    let limit = query
-        .limit
-        .unwrap_or(CDN_DEFAULT_PAGE_SIZE)
-        .clamp(1, CDN_MAX_PAGE_SIZE);
     let page = read_resource_index_page(&state, after_cursor, limit)
         .await
         .map_err(ApiError::internal)?;
@@ -959,17 +956,22 @@ async fn api_resource_index(
     State(state): State<AppState>,
     Query(query): Query<ResourceIndexQuery>,
 ) -> ApiResult<serde_json::Value> {
+    let limit = validated_resource_index_limit(query.limit)?;
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
-    let limit = query
-        .limit
-        .unwrap_or(CDN_DEFAULT_PAGE_SIZE)
-        .clamp(1, CDN_MAX_PAGE_SIZE);
     let page = read_resource_index_page(&state, after_cursor, limit)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(
         serde_json::to_value(page).map_err(|err| ApiError::internal(err.into()))?,
     ))
+}
+
+fn validated_resource_index_limit(limit: Option<i64>) -> Result<i64, ApiError> {
+    let limit = limit.unwrap_or(CDN_DEFAULT_PAGE_SIZE);
+    if !(1..=CDN_MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ApiError::bad_request("invalid_resource_index_page_limit"));
+    }
+    Ok(limit)
 }
 
 async fn read_resource_index_page(
