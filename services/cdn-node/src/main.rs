@@ -44,6 +44,9 @@ const CDN_PUBLISH_HISTORY_TABLE: &str = "cdn_publish_history";
 const CDN_ROOT_META_TABLE: &str = "cdn_root_meta";
 const CDN_RESOURCE_PACKAGE_TABLE: &str = "cdn_resource_packages";
 const MAX_BATCH_PUBLISH_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BATCH_GET_DIDS: usize = 100;
+const MAX_BATCH_GET_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BATCH_GET_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 struct ResourceIndexQuery {
@@ -726,21 +729,39 @@ async fn api_get_resource_packages_batch(
     if request.resource_dids.is_empty() {
         return Err(ApiError::bad_request("empty_resource_dids"));
     }
+    if request.resource_dids.len() > MAX_BATCH_GET_DIDS {
+        return Err(ApiError::bad_request("too_many_resource_dids"));
+    }
     let packages = read_resource_packages_by_dids(&state, &request.resource_dids)
         .await
-        .map_err(ApiError::internal)?;
-    let items = request
-        .resource_dids
-        .iter()
-        .filter_map(|did| {
-            packages.get(did).map(|package| {
-                json!({
-                    "resourceDid": did,
-                    "package": package
-                })
-            })
-        })
-        .collect::<Vec<_>>();
+        .map_err(|err| match err.to_string().as_str() {
+            "resource_package_too_large" | "batch_response_too_large" => {
+                ApiError::bad_request(err.to_string())
+            }
+            _ => ApiError::internal(err),
+        })?;
+    let mut response_bytes = 0_usize;
+    let mut items = Vec::new();
+    for did in &request.resource_dids {
+        let Some(package) = packages.get(did) else {
+            continue;
+        };
+        let package_value = json!({
+            "resourceDid": did,
+            "package": package
+        });
+        let package_bytes = serde_json::to_vec(&package_value)
+            .map_err(|err| ApiError::internal(err.into()))?
+            .len();
+        if package_bytes > MAX_BATCH_GET_PACKAGE_BYTES {
+            return Err(ApiError::bad_request("resource_package_too_large"));
+        }
+        if response_bytes.saturating_add(package_bytes) > MAX_BATCH_GET_RESPONSE_BYTES {
+            return Err(ApiError::bad_request("batch_response_too_large"));
+        }
+        response_bytes = response_bytes.saturating_add(package_bytes);
+        items.push(package_value);
+    }
     Ok(Json(json!({
         "requestedCount": request.resource_dids.len(),
         "foundCount": items.len(),
@@ -1548,10 +1569,20 @@ async fn read_resource_packages_by_dids(
             }
             separated.push_unseparated(")");
             let rows = builder.build().fetch_all(sqlite.pool()).await?;
+            let mut response_bytes = 0_usize;
             for row in rows {
+                let package_json = row.get::<String, _>(1);
+                let package_bytes = package_json.len();
+                if package_bytes > MAX_BATCH_GET_PACKAGE_BYTES {
+                    return Err(anyhow::anyhow!("resource_package_too_large"));
+                }
+                response_bytes = response_bytes.saturating_add(package_bytes);
+                if response_bytes > MAX_BATCH_GET_RESPONSE_BYTES {
+                    return Err(anyhow::anyhow!("batch_response_too_large"));
+                }
                 packages.insert(
                     row.get::<String, _>(0),
-                    serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+                    serde_json::from_str::<ResourcePackage>(&package_json)?,
                 );
             }
         }
@@ -1565,10 +1596,20 @@ async fn read_resource_packages_by_dids(
         .fetch_all(postgres.pool())
         .await?;
         let mut packages = BTreeMap::new();
+        let mut response_bytes = 0_usize;
         for row in rows {
+            let package_json = row.get::<String, _>(1);
+            let package_bytes = package_json.len();
+            if package_bytes > MAX_BATCH_GET_PACKAGE_BYTES {
+                return Err(anyhow::anyhow!("resource_package_too_large"));
+            }
+            response_bytes = response_bytes.saturating_add(package_bytes);
+            if response_bytes > MAX_BATCH_GET_RESPONSE_BYTES {
+                return Err(anyhow::anyhow!("batch_response_too_large"));
+            }
             packages.insert(
                 row.get::<String, _>(0),
-                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+                serde_json::from_str::<ResourcePackage>(&package_json)?,
             );
         }
         return Ok(packages);
