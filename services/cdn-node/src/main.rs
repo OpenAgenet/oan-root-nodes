@@ -1019,10 +1019,9 @@ async fn read_resource_index_page(
     limit: i64,
 ) -> Result<ResourceCdnIndexResponse> {
     let page_limit = limit.max(1);
-    let fetch_limit = page_limit + 1;
     let mut rows = Vec::<ResourceCdnIndexItem>::new();
     let mut page_bytes = 0_usize;
-    let mut has_more = false;
+    let has_more;
     if let Some(sqlite) = &state.sqlite {
         let query = format!(
             r#"
@@ -1107,7 +1106,8 @@ async fn read_resource_index_page(
                 .cmp(&b.cursor)
                 .then(a.package.resource_did.cmp(&b.package.resource_did))
         });
-        for item in indexed.into_iter().take(fetch_limit as usize) {
+        has_more = indexed.len() > page_limit as usize;
+        for item in indexed.into_iter().take(page_limit as usize) {
             let package_bytes = serde_json::to_vec(&item.package)?.len();
             if package_bytes > MAX_INDEX_PACKAGE_BYTES {
                 return Err(anyhow::anyhow!("resource_index_package_too_large"));
