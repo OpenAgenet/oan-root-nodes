@@ -15,7 +15,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use oan_bulletin::{Bulletin, BulletinEvent, BulletinEventCore, BulletinEventType};
-use oan_core::{CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
+use oan_core::{
+    CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
+};
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, sign_bytes, signature_input,
     signing_key_from_bytes, SigningKey,
@@ -3947,19 +3949,12 @@ fn normalize_chain_metadata_hash(value: &str) -> String {
 }
 
 fn validate_infrastructure_did_prefix(
-    subject_type: GovernanceSubjectType,
+    _subject_type: GovernanceSubjectType,
     did: &str,
 ) -> std::result::Result<(), String> {
-    let expected_prefix = match subject_type {
-        GovernanceSubjectType::Registrar => "did:oan:INRG:",
-        GovernanceSubjectType::Discovery => "did:oan:INDS:",
-        GovernanceSubjectType::VcIssuer => "did:oan:INVC:",
-    };
-    if did.starts_with(expected_prefix) {
-        Ok(())
-    } else {
-        Err("infrastructure_did_prefix_mismatch".to_owned())
-    }
+    oan_did_oan::DidOan::parse(did)
+        .map(|_| ())
+        .map_err(|_| "infrastructure_did_format_mismatch".to_owned())
 }
 
 fn validate_infrastructure_did_document_profile(
@@ -3988,18 +3983,16 @@ fn validate_infrastructure_did_document_profile(
         .oan_metadata
         .as_ref()
         .ok_or_else(|| "did_document_oan_metadata_required".to_owned())?;
-    if metadata.subject_type != ResourceType::InfrastructureNode
-        || metadata.resource_type != ResourceType::InfrastructureNode
-    {
+    if metadata.subject_type != SubjectType::InfrastructureNode {
         return Err("did_document_infrastructure_metadata_required".to_owned());
     }
-    let expected_node_role = match subject_type {
-        GovernanceSubjectType::Registrar => "registrar",
-        GovernanceSubjectType::Discovery => "discovery",
-        GovernanceSubjectType::VcIssuer => "vc_issuer",
+    let expected_resource_type = match subject_type {
+        GovernanceSubjectType::Registrar => ResourceType::RegistrarNode,
+        GovernanceSubjectType::Discovery => ResourceType::DiscoveryNode,
+        GovernanceSubjectType::VcIssuer => ResourceType::VcIssuerNode,
     };
-    if metadata.node_role.as_deref() != Some(expected_node_role) {
-        return Err("did_document_node_role_mismatch".to_owned());
+    if metadata.resource_type != expected_resource_type {
+        return Err("did_document_infrastructure_role_mismatch".to_owned());
     }
     let expected_identity_type = match subject_type {
         GovernanceSubjectType::Registrar => "registrar-node",

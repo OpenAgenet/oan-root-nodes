@@ -188,7 +188,7 @@ fn default_nonce_ttl_seconds() -> i64 {
 }
 
 fn default_root_did() -> String {
-    "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
+    "did:oan:AGRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
 }
 
 fn default_root_did_document_file() -> PathBuf {
