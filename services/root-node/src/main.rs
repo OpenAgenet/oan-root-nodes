@@ -27,7 +27,7 @@ use oan_package::{
     RootProof,
 };
 use oan_protocol::{
-    HealthResponse, InfrastructureAuthorizationVcIssuePayload,
+    validate_resource_routing_code, HealthResponse, InfrastructureAuthorizationVcIssuePayload,
     InfrastructureAuthorizationVcIssueRequest, ResourceVerifyAndPublishRequest,
     RootAuthorizeRequest, PATH_ROOT_INFRASTRUCTURE_AUTHORIZATION_VCS_ISSUE,
     PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
@@ -5005,6 +5005,7 @@ fn verify_resource_request(
     )
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
+    validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
 }
 
@@ -5186,6 +5187,14 @@ fn archive_resource_verified(state: &AppState, package: &ResourcePackage) -> Res
         name.trim_end_matches(".json"),
         package.package_version
     );
+    if let Ok(existing) = state
+        .data
+        .read::<ResourcePackage>(format!("{prefix}/resource-package.json"))
+    {
+        if existing.did_document_hash != package.did_document_hash {
+            return Err(anyhow!("resource_version_conflict"));
+        }
+    }
     state
         .data
         .write(format!("{prefix}/did-document.json"), &package.did_document)?;
