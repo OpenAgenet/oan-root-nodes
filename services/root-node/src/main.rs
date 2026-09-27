@@ -834,6 +834,10 @@ struct GovernanceSubjectRecord {
 struct TrustIndexerStatus {
     package_id: Option<String>,
     bulletin_object_id: Option<String>,
+    #[serde(default)]
+    sequence_gap_detected: bool,
+    #[serde(default)]
+    digest_gap_detected: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1626,10 +1630,14 @@ async fn fetch_trust_indexer_status(
             response.status().as_u16()
         ));
     }
-    response
+    let status = response
         .json::<TrustIndexerStatus>()
         .await
-        .map_err(|err| format!("trust_indexer_status_decode_failed:{err}"))
+        .map_err(|err| format!("trust_indexer_status_decode_failed:{err}"))?;
+    if status.sequence_gap_detected || status.digest_gap_detected {
+        return Err("trust_indexer_status_not_healthy".to_owned());
+    }
+    Ok(status)
 }
 
 fn validate_governance_subject_binding(
@@ -2423,7 +2431,9 @@ async fn issue_infrastructure_authorization_vc(
         &governance_subject,
     )
     .map_err(ApiError::forbidden)?;
-    let indexer_status = fetch_trust_indexer_status(&state).await.unwrap_or_default();
+    let indexer_status = fetch_trust_indexer_status(&state)
+        .await
+        .map_err(ApiError::forbidden)?;
     let credential = build_infrastructure_authorization_credential(
         &state,
         subject_type,
