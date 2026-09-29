@@ -868,6 +868,7 @@ struct DiscoveryNotifyTargetLease {
     discovery_did: String,
     target_cursor: i64,
     delivered_cursor: i64,
+    lease_owner: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2682,20 +2683,11 @@ fn effective_worker_batch_size(
 
 fn effective_discovery_target_item_batch_size(
     configured: usize,
-    claimed_target_count: usize,
-    concurrency: usize,
-    claimed_cursor_lag: i64,
+    _claimed_target_count: usize,
+    _concurrency: usize,
+    _claimed_cursor_lag: i64,
 ) -> usize {
-    let base = configured.max(1);
-    let lag = claimed_cursor_lag.max(0) as usize;
-    let active_targets = claimed_target_count.max(1);
-    if active_targets <= concurrency.max(1) / 2 && lag > base.saturating_mul(active_targets * 2) {
-        return base.saturating_mul(4).min(1_000);
-    }
-    if active_targets <= concurrency.max(1) && lag > base.saturating_mul(active_targets) {
-        return base.saturating_mul(2).min(500);
-    }
-    base
+    configured.max(1)
 }
 
 fn record_discovery_worker_runtime(state: &AppState, sample: DiscoveryWorkerRuntimeSample) {
@@ -5514,8 +5506,15 @@ async fn mark_discovery_target_notified(
     state: &AppState,
     discovery_did: &str,
     delivered_cursor: i64,
+    lease_owner: &str,
 ) -> Result<()> {
-    repository::mark_discovery_target_notified_impl(state, discovery_did, delivered_cursor).await?;
+    repository::mark_discovery_target_notified_impl(
+        state,
+        discovery_did,
+        delivered_cursor,
+        lease_owner,
+    )
+    .await?;
     invalidate_status_counts_cache(state);
     Ok(())
 }
@@ -5524,8 +5523,9 @@ async fn mark_discovery_target_retry(
     state: &AppState,
     discovery_did: &str,
     error: &str,
+    lease_owner: &str,
 ) -> Result<()> {
-    repository::mark_discovery_target_retry_impl(state, discovery_did, error).await?;
+    repository::mark_discovery_target_retry_impl(state, discovery_did, error, lease_owner).await?;
     invalidate_status_counts_cache(state);
     Ok(())
 }
@@ -5798,6 +5798,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         &state,
                         &lease.discovery_did,
                         "discovery_not_authorized",
+                        &lease.lease_owner,
                     )
                     .await?;
                     return Ok::<Value, anyhow::Error>(json!({
@@ -5811,6 +5812,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         &state,
                         &lease.discovery_did,
                         "discovery_not_active",
+                        &lease.lease_owner,
                     )
                     .await?;
                     return Ok(json!({
@@ -5826,7 +5828,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                 )
                 .await
                 {
-                    mark_discovery_target_retry(&state, &lease.discovery_did, &reason).await?;
+                    mark_discovery_target_retry(
+                        &state,
+                        &lease.discovery_did,
+                        &reason,
+                        &lease.lease_owner,
+                    )
+                    .await?;
                     mark_local_governance_inactive(
                         &state,
                         GovernanceSubjectType::Discovery,
@@ -5842,8 +5850,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                 let sync_url = match discovery_sync_url(&auth) {
                     Ok(url) => url,
                     Err(err) => {
-                        mark_discovery_target_retry(&state, &lease.discovery_did, &err.to_string())
-                            .await?;
+                        mark_discovery_target_retry(
+                            &state,
+                            &lease.discovery_did,
+                            &err.to_string(),
+                            &lease.lease_owner,
+                        )
+                        .await?;
                         return Ok(json!({
                             "kind": "failed",
                             "discoveryDid": lease.discovery_did,
@@ -5899,6 +5912,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 &state,
                                 &lease.discovery_did,
                                 delivered_cursor,
+                                &lease.lease_owner,
                             )
                             .await?;
                             if delivered_cursor < lease.target_cursor {
@@ -5910,8 +5924,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 "discovery_partial_sync:delivered={delivered_cursor}:target={}:rejected={rejected_count}:cursorLag={cursor_lag}",
                                 batch_target_cursor
                             );
-                            mark_discovery_target_retry(&state, &lease.discovery_did, &error)
-                                .await?;
+                            mark_discovery_target_retry(
+                                &state,
+                                &lease.discovery_did,
+                                &error,
+                                &lease.lease_owner,
+                            )
+                            .await?;
                             return Ok(json!({
                                 "kind": "partial",
                                 "rootDid": state.root_did,
@@ -5970,7 +5989,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         } else {
                             format!("status:{status}:{body}")
                         };
-                        mark_discovery_target_retry(&state, &lease.discovery_did, &error).await?;
+                        mark_discovery_target_retry(
+                            &state,
+                            &lease.discovery_did,
+                            &error,
+                            &lease.lease_owner,
+                        )
+                        .await?;
                         Ok(json!({
                             "kind": "failed",
                             "discoveryDid": lease.discovery_did,
@@ -5981,7 +6006,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                     }
                     Err(err) => {
                         let error = err.to_string();
-                        mark_discovery_target_retry(&state, &lease.discovery_did, &error).await?;
+                        mark_discovery_target_retry(
+                            &state,
+                            &lease.discovery_did,
+                            &error,
+                            &lease.lease_owner,
+                        )
+                        .await?;
                         Ok(json!({
                             "kind": "failed",
                             "discoveryDid": lease.discovery_did,
