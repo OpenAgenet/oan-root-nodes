@@ -23,7 +23,10 @@ use oan_credentials::{
     CredentialStatusReference,
     InfrastructureAuthorizationCredentialSubject, OanInfrastructureAuthorizationCredential,
 };
-use oan_crypto::{build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes, SigningKey};
+use oan_crypto::{
+    build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes,
+    verify_did_document_proof, SigningKey,
+};
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
     RootProof,
@@ -3980,6 +3983,8 @@ fn validate_infrastructure_did_document_profile(
     did_document
         .validate_infrastructure_profile(expected_resource_type.clone())
         .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
+    verify_did_document_proof(did_document)
+        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     let expected_service_type = match subject_type {
         GovernanceSubjectType::Registrar => "OANRegistrarService",
         GovernanceSubjectType::Discovery => "OANDiscoveryService",
@@ -4959,6 +4964,8 @@ fn verify_resource_request(
     )
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
+    verify_did_document_proof(&request.submission.did_document)
+        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
 }
@@ -6255,4 +6262,5 @@ fn tag(id: &str, label: &str, parent: Option<&str>, aliases: &[&str]) -> Capabil
         aliases: aliases.iter().map(|value| (*value).to_owned()).collect(),
     }
 }
+
 
