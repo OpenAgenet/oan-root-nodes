@@ -4991,6 +4991,8 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
+    verify_did_document_proof(&bundle.controller_did_document)
+        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method_id = verify_controller_authorization_proof(
         bundle,
