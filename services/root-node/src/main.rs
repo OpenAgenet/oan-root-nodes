@@ -19,7 +19,7 @@ use oan_core::{
     CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
 };
 use oan_credentials::{
-    sign_credential, validate_infrastructure_authorization_credential, CredentialProof,
+    sign_credential_data_integrity, validate_infrastructure_authorization_credential, CredentialProof,
     CredentialStatusReference,
     InfrastructureAuthorizationCredentialSubject, OanInfrastructureAuthorizationCredential,
 };
@@ -2244,11 +2244,7 @@ async fn verify_resource_and_publish(
         hash_algorithm: request.submission.hash_algorithm.clone(),
         lifecycle_state: metadata.lifecycle_state.clone(),
         authorized_domains: metadata.authorized_domains.clone(),
-        bulletin_ref: metadata
-            .protocol_bindings
-            .iter()
-            .find_map(|value| value.get("bulletinRef").and_then(Value::as_str))
-            .map(ToOwned::to_owned),
+        bulletin_ref: None,
     };
     let claims_value = serde_json::to_value(&package_claims).map_err(ApiError::internal)?;
     let package = ResourcePackage {
@@ -2451,6 +2447,7 @@ async fn issue_infrastructure_authorization_vc(
         &request.payload,
         &did_document_stable_hash,
     )
+    .await
     .map_err(ApiError::internal)?;
 
     match subject_type {
@@ -3853,7 +3850,16 @@ async fn validate_authorization_vc_issue_request(
     if !request.payload.subject_did.starts_with("did:oan:") {
         return Err("unsupported_subject_did_method".to_owned());
     }
-    validate_infrastructure_did_prefix(subject_type, &request.payload.subject_did)?;
+    validate_infrastructure_did_prefix(
+        &state.root_did,
+        subject_type,
+        &request.payload.subject_did,
+    )?;
+    validate_infrastructure_suffix_prefix_unique(
+        &state,
+        subject_type,
+        &request.payload.subject_did,
+    )?;
     if request.payload.did_document.id != request.payload.subject_did {
         return Err("did_document_subject_mismatch".to_owned());
     }
@@ -3935,12 +3941,60 @@ fn normalize_chain_metadata_hash(value: &str) -> String {
 }
 
 fn validate_infrastructure_did_prefix(
+    root_did: &str,
     _subject_type: GovernanceSubjectType,
     did: &str,
 ) -> std::result::Result<(), String> {
-    oan_did_oan::DidOan::parse(did)
-        .map(|_| ())
-        .map_err(|_| "infrastructure_did_format_mismatch".to_owned())
+    let root = oan_did_oan::DidOan::parse(root_did)
+        .map_err(|_| "root_did_format_mismatch".to_owned())?;
+    let subject = oan_did_oan::DidOan::parse(did)
+        .map_err(|_| "infrastructure_did_format_mismatch".to_owned())?;
+    if subject.routing_code() != root.suffix_code().get(..5).unwrap_or_default() {
+        return Err("infrastructure_routing_code_mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_infrastructure_suffix_prefix_unique(
+    state: &AppState,
+    subject_type: GovernanceSubjectType,
+    did: &str,
+) -> std::result::Result<(), String> {
+    let subject = oan_did_oan::DidOan::parse(did)
+        .map_err(|_| "infrastructure_did_format_mismatch".to_owned())?;
+    let prefix = subject.suffix_code().get(..5).unwrap_or_default();
+    let authorization_state = state
+        .authorization_state
+        .lock()
+        .map_err(|_| "authorization_state_unavailable".to_owned())?;
+    let documents = match subject_type {
+        GovernanceSubjectType::Registrar => authorization_state
+            .registrars
+            .values()
+            .filter_map(|entry| (entry.status == "active").then_some(entry.did_document_snapshot.as_ref()).flatten())
+            .collect::<Vec<_>>(),
+        GovernanceSubjectType::Discovery => authorization_state
+            .discovery_nodes
+            .values()
+            .filter_map(|entry| (entry.status == "active").then_some(entry.did_document_snapshot.as_ref()).flatten())
+            .collect::<Vec<_>>(),
+        GovernanceSubjectType::VcIssuer => authorization_state
+            .vc_issuers
+            .values()
+            .filter_map(|entry| (entry.status == "active").then_some(entry.did_document_snapshot.as_ref()).flatten())
+            .collect::<Vec<_>>(),
+    };
+    for document in documents {
+        if document.id != did
+            && oan_did_oan::DidOan::parse(&document.id)
+                .ok()
+                .map(|value| value.suffix_code()[..5].to_owned())
+                == Some(prefix.to_owned())
+        {
+            return Err("infrastructure_suffix_prefix_conflict".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn validate_infrastructure_did_document_profile(
@@ -4033,16 +4087,7 @@ fn did_document_chain_governance_stable_hash(did_document: &DidDocument) -> Opti
         .map(ToOwned::to_owned)
 }
 
-fn build_infrastructure_authorization_proof(
-    unsigned: &Value,
-    verification_method: String,
-    signing_key: &SigningKey,
-) -> Result<CredentialProof> {
-    sign_credential(unsigned, verification_method.clone(), verification_method, signing_key)
-        .map_err(Into::into)
-}
-
-fn build_infrastructure_authorization_credential(
+async fn build_infrastructure_authorization_credential(
     state: &AppState,
     subject_type: GovernanceSubjectType,
     payload: &InfrastructureAuthorizationVcIssuePayload,
@@ -4098,22 +4143,25 @@ fn build_infrastructure_authorization_credential(
         credential_subject: subject,
         credential_status: Some(credential_status),
         credential_schema: None,
-        proof: build_infrastructure_authorization_proof(
-            &json!({}),
-            format!("{}#key-1", state.root_did),
-            &state.signing_key,
-        )?,
+        proof: CredentialProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            created: issuance_date,
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: "z".to_owned(),
+            verification_method: format!("{}#key-1", state.root_did),
+        },
     };
     let mut payload_without_proof = serde_json::to_value(&unsigned)?;
     payload_without_proof
         .as_object_mut()
         .expect("credential serializes as object")
         .remove("proof");
-    let proof = build_infrastructure_authorization_proof(
+    let proof = sign_credential_data_integrity(
         &payload_without_proof,
         format!("{}#key-1", state.root_did),
         &state.signing_key,
-    )?;
+    )
+    .await?;
     let credential = OanInfrastructureAuthorizationCredential { proof, ..unsigned };
     validate_infrastructure_authorization_credential(&credential)
         .map_err(|error| anyhow!("invalid infrastructure authorization credential: {error}"))?;
