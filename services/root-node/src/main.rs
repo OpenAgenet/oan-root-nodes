@@ -2350,6 +2350,7 @@ async fn verify_resource_and_publish_with_raw_document(
         resource_did: request.submission.resource_did.clone(),
         resource_type: request.submission.resource_type.clone(),
         did_document: request.submission.did_document.clone(),
+        did_document_raw: Some(raw_did_document.clone()),
         did_document_hash: request.submission.did_document_hash.clone(),
         metadata_hash: request.submission.metadata_hash.clone(),
         package_hash: request.submission.package_hash.clone(),
