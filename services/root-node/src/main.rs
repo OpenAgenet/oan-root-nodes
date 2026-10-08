@@ -6448,17 +6448,34 @@ fn cdn_cycle_should_continue_immediately(result: &Value) -> bool {
 }
 
 fn discovery_cycle_made_progress(result: &Value) -> bool {
-    value_u64(result, "notifiedCount") > 0 || value_u64(result, "failedCount") > 0
+    discovery_cycle_advanced_cursor_count(result) > 0
 }
 
 fn discovery_cycle_should_continue_immediately(result: &Value) -> bool {
-    let ready_after = value_u64(result, "readyQueueDepthAfter");
-    let claimed_targets = value_u64(result, "claimedTargetCount");
-    let effective_batch_size = value_u64(result, "effectiveBatchSize");
-    let carry_forward_count = value_u64(result, "carryForwardCount");
-    ready_after > 0
-        || carry_forward_count > 0
-        || (effective_batch_size > 0 && claimed_targets >= effective_batch_size)
+    discovery_cycle_advanced_cursor_count(result) > 0
+}
+
+fn discovery_cycle_advanced_cursor_count(result: &Value) -> u64 {
+    result
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|targets| {
+            targets
+                .iter()
+                .filter(|target| {
+                    let delivered = target
+                        .get("deliveredCursor")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
+                    let previous = target
+                        .get("previousDeliveredCursor")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
+                    delivered > previous
+                })
+                .count() as u64
+        })
+        .unwrap_or_default()
 }
 
 async fn cdn_queue_depths(state: &AppState) -> Result<(usize, usize)> {
