@@ -4695,10 +4695,8 @@ async fn bootstrap_identity_directory_projection(state: &AppState) -> Result<()>
         return Ok(());
     }
     if identity_directory_is_empty(state).await? {
-        upsert_identity_bootstrap_state(state, "resource_projection", "running", 0, None)
-            .await?;
-        upsert_identity_bootstrap_state(state, "binding_projection", "running", 0, None)
-            .await?;
+        upsert_identity_bootstrap_state(state, "resource_projection", "running", 0, None).await?;
+        upsert_identity_bootstrap_state(state, "binding_projection", "running", 0, None).await?;
     }
     backfill_identity_resource_projections(state, 100).await?;
     bootstrap_identity_binding_projections(state).await
