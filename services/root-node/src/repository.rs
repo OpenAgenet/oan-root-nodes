@@ -2632,12 +2632,16 @@ async fn postgres_publication_projection_rows_by_cursor_range(
     };
     let rows = sqlx::query(&format!(
         r#"
-        SELECT publication_cursor, subject_did, version, package_hash, metadata_hash,
-               did_document_hash, resource_type, capability_tags_json::text,
-               authorized_domains_json::text
-        FROM {ROOT_SUBJECT_VERSION_TABLE}
-        WHERE publication_cursor > $1 AND publication_cursor <= $2
-        ORDER BY publication_cursor
+        SELECT versions.publication_cursor, versions.subject_did, versions.version,
+               versions.package_hash, versions.metadata_hash, versions.did_document_hash,
+               versions.resource_type, versions.capability_tags_json::text,
+               versions.authorized_domains_json::text
+        FROM {ROOT_SUBJECT_VERSION_TABLE} AS versions
+        JOIN {ROOT_CDN_JOB_TABLE} AS jobs
+          ON jobs.job_key = versions.subject_did || ':' || versions.version
+        WHERE versions.publication_cursor > $1 AND versions.publication_cursor <= $2
+          AND jobs.status = 'published'
+        ORDER BY versions.publication_cursor
         LIMIT $3
         "#
     ))
@@ -2662,6 +2666,46 @@ async fn postgres_publication_projection_rows_by_cursor_range(
             })
         })
         .collect()
+}
+
+async fn first_unpublished_publication_cursor(
+    state: &AppState,
+    delivered_cursor: i64,
+    target_cursor: i64,
+) -> Result<Option<i64>> {
+    if let Some(sqlite) = &state.sqlite {
+        return Ok(sqlx::query_scalar::<_, Option<i64>>(&format!(
+            r#"
+            SELECT MIN(versions.publication_cursor)
+            FROM {ROOT_SUBJECT_VERSION_TABLE} AS versions
+            LEFT JOIN {ROOT_CDN_JOB_TABLE} AS jobs
+              ON jobs.job_key = versions.subject_did || ':' || versions.version
+            WHERE versions.publication_cursor > ? AND versions.publication_cursor <= ?
+              AND COALESCE(jobs.status, 'ready') <> 'published'
+            "#
+        ))
+        .bind(delivered_cursor)
+        .bind(target_cursor)
+        .fetch_one(sqlite.pool())
+        .await?);
+    }
+    if let Some(postgres) = &state.postgres {
+        return Ok(sqlx::query_scalar::<_, Option<i64>>(&format!(
+            r#"
+            SELECT MIN(versions.publication_cursor)
+            FROM {ROOT_SUBJECT_VERSION_TABLE} AS versions
+            LEFT JOIN {ROOT_CDN_JOB_TABLE} AS jobs
+              ON jobs.job_key = versions.subject_did || ':' || versions.version
+            WHERE versions.publication_cursor > $1 AND versions.publication_cursor <= $2
+              AND COALESCE(jobs.status, 'ready') <> 'published'
+            "#
+        ))
+        .bind(delivered_cursor)
+        .bind(target_cursor)
+        .fetch_one(postgres.pool())
+        .await?);
+    }
+    Ok(None)
 }
 
 async fn sqlite_cdn_jobs_all_published(state: &AppState, job_keys: &[String]) -> Result<bool> {
@@ -2825,7 +2869,7 @@ pub(super) async fn authorized_discovery_summary_items_impl(
     target_cursor: i64,
     max_items: usize,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
-    if target_cursor <= delivered_cursor {
+    if target_cursor <= delivered_cursor || max_items == 0 {
         return Ok(Vec::new());
     }
     let Some(discovery_auth) = super::current_authorization_state(state)
@@ -2839,32 +2883,48 @@ pub(super) async fn authorized_discovery_summary_items_impl(
         return Ok(Vec::new());
     }
 
-    let stored_items = load_authorized_discovery_summary_items_from_store(
+    let target_cursor =
+        first_unpublished_publication_cursor(state, delivered_cursor, target_cursor)
+            .await?
+            .map_or(target_cursor, |cursor| cursor.saturating_sub(1));
+    if target_cursor <= delivered_cursor {
+        return Ok(Vec::new());
+    }
+
+    let mut items_by_cursor = std::collections::BTreeMap::<i64, DiscoveryNotificationItem>::new();
+    for item in load_authorized_discovery_summary_items_from_store(
         state,
         discovery_did,
         delivered_cursor,
         target_cursor,
         max_items,
     )
-    .await?;
-    let mut items_by_cursor = std::collections::BTreeMap::<i64, DiscoveryNotificationItem>::new();
-    for item in stored_items {
-        items_by_cursor.insert(item.publication_cursor, item);
-    }
-    if !items_by_cursor.is_empty() {
-        return Ok(items_by_cursor.into_values().take(max_items).collect());
+    .await?
+    {
+        if authorized_domains_match(&item.authorized_domains, &discovery_auth.authorized_domains) {
+            items_by_cursor.insert(item.publication_cursor, item);
+        }
     }
 
     if let Some(sqlite) = &state.sqlite {
         let window = max_items.max(1).saturating_mul(4).max(100);
         let mut scan_cursor = delivered_cursor;
-        while scan_cursor < target_cursor && items_by_cursor.len() < max_items {
+        while scan_cursor < target_cursor
+            && (items_by_cursor.len() < max_items
+                || items_by_cursor
+                    .keys()
+                    .nth(max_items - 1)
+                    .is_some_and(|cursor| scan_cursor < *cursor))
+        {
             let rows = sqlx::query(&format!(
                 r#"
-                SELECT publication_cursor, package_json
-                FROM {ROOT_SUBJECT_VERSION_TABLE}
-                WHERE publication_cursor > ? AND publication_cursor <= ?
-                ORDER BY publication_cursor
+                SELECT versions.publication_cursor, versions.package_json
+                FROM {ROOT_SUBJECT_VERSION_TABLE} AS versions
+                JOIN {ROOT_CDN_JOB_TABLE} AS jobs
+                  ON jobs.job_key = versions.subject_did || ':' || versions.version
+                WHERE versions.publication_cursor > ? AND versions.publication_cursor <= ?
+                  AND jobs.status = 'published'
+                ORDER BY versions.publication_cursor
                 LIMIT ?
                 "#
             ))
@@ -2900,7 +2960,13 @@ pub(super) async fn authorized_discovery_summary_items_impl(
     } else if state.postgres.is_some() {
         let window = max_items.max(1).saturating_mul(4).max(100);
         let mut scan_cursor = delivered_cursor;
-        while scan_cursor < target_cursor && items_by_cursor.len() < max_items {
+        while scan_cursor < target_cursor
+            && (items_by_cursor.len() < max_items
+                || items_by_cursor
+                    .keys()
+                    .nth(max_items - 1)
+                    .is_some_and(|cursor| scan_cursor < *cursor))
+        {
             let rows = postgres_publication_projection_rows_by_cursor_range(
                 state,
                 scan_cursor,
@@ -2932,14 +2998,14 @@ pub(super) async fn authorized_discovery_summary_items_impl(
         }
         return Ok(items_by_cursor.into_values().take(max_items).collect());
     }
-    Ok(items_by_cursor.into_values().collect())
+    Ok(items_by_cursor.into_values().take(max_items).collect())
 }
 
 async fn load_authorized_discovery_summary_items_from_store(
     state: &AppState,
     discovery_did: &str,
-    _delivered_cursor: i64,
-    _target_cursor: i64,
+    delivered_cursor: i64,
+    target_cursor: i64,
     max_items: usize,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
     let now = Utc::now();
@@ -2951,6 +3017,7 @@ async fn load_authorized_discovery_summary_items_from_store(
                    authorized_domains_json
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
             WHERE discovery_did = ?
+              AND publication_cursor > ? AND publication_cursor <= ?
               AND status IN ('pending', 'retry')
               AND next_attempt_at <= ?
             ORDER BY publication_cursor
@@ -2958,6 +3025,8 @@ async fn load_authorized_discovery_summary_items_from_store(
             "#
         ))
         .bind(discovery_did)
+        .bind(delivered_cursor)
+        .bind(target_cursor)
         .bind(now.to_rfc3339())
         .bind(max_items as i64)
         .fetch_all(sqlite.pool())
@@ -2989,13 +3058,16 @@ async fn load_authorized_discovery_summary_items_from_store(
                    authorized_domains_json::text
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
             WHERE discovery_did = $1
+              AND publication_cursor > $2 AND publication_cursor <= $3
               AND status IN ('pending', 'retry')
-              AND next_attempt_at <= $2::timestamptz
+              AND next_attempt_at <= $4::timestamptz
             ORDER BY publication_cursor
-            LIMIT $3
+            LIMIT $5
             "#
         ))
         .bind(discovery_did)
+        .bind(delivered_cursor)
+        .bind(target_cursor)
         .bind(now)
         .bind(max_items as i64)
         .fetch_all(postgres.pool())

@@ -6469,6 +6469,21 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                     discovery_item_batch_size.max(1),
                 )
                 .await?;
+                if summary_items.is_empty() {
+                    let error = "discovery_summary_waiting_for_publication";
+                    mark_discovery_target_retry(
+                        &state,
+                        &lease.discovery_did,
+                        error,
+                        &lease.lease_owner,
+                    )
+                    .await?;
+                    return Ok(json!({
+                        "kind": "deferred",
+                        "discoveryDid": lease.discovery_did,
+                        "error": error
+                    }));
+                }
                 let max_items = discovery_item_batch_size.max(1);
                 let batch_target_cursor = summary_items
                     .last()
