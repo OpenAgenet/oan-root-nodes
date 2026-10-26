@@ -2670,40 +2670,73 @@ async fn postgres_publication_projection_rows_by_cursor_range(
 
 async fn first_unpublished_publication_cursor(
     state: &AppState,
+    authorized_domains: &[String],
     delivered_cursor: i64,
     target_cursor: i64,
 ) -> Result<Option<i64>> {
     if let Some(sqlite) = &state.sqlite {
-        return Ok(sqlx::query_scalar::<_, Option<i64>>(&format!(
+        let rows = sqlx::query(&format!(
             r#"
-            SELECT MIN(versions.publication_cursor)
+            SELECT versions.publication_cursor, versions.package_json
             FROM {ROOT_SUBJECT_VERSION_TABLE} AS versions
             LEFT JOIN {ROOT_CDN_JOB_TABLE} AS jobs
               ON jobs.job_key = versions.subject_did || ':' || versions.version
             WHERE versions.publication_cursor > ? AND versions.publication_cursor <= ?
               AND COALESCE(jobs.status, 'ready') <> 'published'
+            ORDER BY versions.publication_cursor
             "#
         ))
         .bind(delivered_cursor)
         .bind(target_cursor)
-        .fetch_one(sqlite.pool())
-        .await?);
+        .fetch_all(sqlite.pool())
+        .await?;
+        for row in rows {
+            let package_json = row.get::<String, _>(1);
+            let matches = serde_json::from_str::<ResourcePackage>(&package_json)
+                .map(|package| {
+                    authorized_domains_match(
+                        &package.metadata.authorized_domains,
+                        authorized_domains,
+                    )
+                })
+                .unwrap_or(true);
+            if matches {
+                return Ok(Some(row.get::<i64, _>(0)));
+            }
+        }
+        return Ok(None);
     }
     if let Some(postgres) = &state.postgres {
-        return Ok(sqlx::query_scalar::<_, Option<i64>>(&format!(
+        let rows = sqlx::query(&format!(
             r#"
-            SELECT MIN(versions.publication_cursor)
+            SELECT versions.publication_cursor, versions.package_json::text
             FROM {ROOT_SUBJECT_VERSION_TABLE} AS versions
             LEFT JOIN {ROOT_CDN_JOB_TABLE} AS jobs
               ON jobs.job_key = versions.subject_did || ':' || versions.version
             WHERE versions.publication_cursor > $1 AND versions.publication_cursor <= $2
               AND COALESCE(jobs.status, 'ready') <> 'published'
+            ORDER BY versions.publication_cursor
             "#
         ))
         .bind(delivered_cursor)
         .bind(target_cursor)
-        .fetch_one(postgres.pool())
-        .await?);
+        .fetch_all(postgres.pool())
+        .await?;
+        for row in rows {
+            let package_json = row.get::<String, _>(1);
+            let matches = serde_json::from_str::<ResourcePackage>(&package_json)
+                .map(|package| {
+                    authorized_domains_match(
+                        &package.metadata.authorized_domains,
+                        authorized_domains,
+                    )
+                })
+                .unwrap_or(true);
+            if matches {
+                return Ok(Some(row.get::<i64, _>(0)));
+            }
+        }
+        return Ok(None);
     }
     Ok(None)
 }
@@ -2883,10 +2916,14 @@ pub(super) async fn authorized_discovery_summary_items_impl(
         return Ok(Vec::new());
     }
 
-    let target_cursor =
-        first_unpublished_publication_cursor(state, delivered_cursor, target_cursor)
-            .await?
-            .map_or(target_cursor, |cursor| cursor.saturating_sub(1));
+    let target_cursor = first_unpublished_publication_cursor(
+        state,
+        &discovery_auth.authorized_domains,
+        delivered_cursor,
+        target_cursor,
+    )
+    .await?
+    .map_or(target_cursor, |cursor| cursor.saturating_sub(1));
     if target_cursor <= delivered_cursor {
         return Ok(Vec::new());
     }
