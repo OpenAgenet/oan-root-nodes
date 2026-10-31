@@ -5518,18 +5518,24 @@ fn verify_resource_request_with_raw_document(
     request: &ResourceVerifyAndPublishRequest,
     raw_did_document: &Value,
 ) -> std::result::Result<(), String> {
+    verify_resource_request_with_envelope_check(state, request, raw_did_document, |document, policy| {
+        verify_signed_request_envelope(
+            &request.upstream_auth, &request.submission, &request.registrar_did,
+            document, policy, Utc::now(),
+        ).map(|_| ()).map_err(|err| err.to_string())
+    })
+}
+
+fn verify_resource_request_with_envelope_check(
+    state: &AppState,
+    request: &ResourceVerifyAndPublishRequest,
+    raw_did_document: &Value,
+    check: impl FnOnce(&DidDocument, &TrustedUpstreamPolicy) -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
     let registrar_document = load_authorized_registrar_document(state, &request.registrar_did)
         .map_err(|_| "registrar_not_authorized".to_owned())?;
     let policy = trusted_upstream_policy(state, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH);
-    verify_signed_request_envelope(
-        &request.upstream_auth,
-        &request.submission,
-        &request.registrar_did,
-        &registrar_document,
-        &policy,
-        Utc::now(),
-    )
-    .map_err(|err| err.to_string())?;
+    check(&registrar_document, &policy)?;
     request.submission.validate_shape()?;
     verify_resource_did_document_for_wire(raw_did_document.clone())
         .map_err(|_| "did_document_proof_invalid".to_owned())?;
