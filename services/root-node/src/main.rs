@@ -24,8 +24,9 @@ use oan_credentials::{
 };
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, signing_key_from_private_key_jwk,
-    verify_did_document_proof, verify_did_document_proof_standard_value_blocking,
-    verify_oan_data_integrity, SigningKey,
+    verify_did_document_proof, verify_did_document_proof_compatible_value_isolated,
+    verify_did_document_proof_standard_value_blocking, verify_oan_data_integrity, SigningKey,
+    VerifiedWireDidDocument,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -2522,13 +2523,21 @@ async fn verify_resource_and_publish_raw(
         .cloned()
         .or_else(|| payload.pointer("/submission/didDocument").cloned())
         .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
-    verify_resource_did_document_for_wire(raw_did_document.clone())?;
+    let verified_did_document = verify_resource_did_document_for_wire(raw_did_document).await?;
     let request: ResourceVerifyAndPublishRequest = serde_json::from_value(payload)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    verify_resource_and_publish_with_raw_document(state, request, raw_did_document).await
+    verify_resource_and_publish_with_raw_document(state, request, verified_did_document).await
 }
 
-fn verify_resource_did_document_for_wire(
+async fn verify_resource_did_document_for_wire(
+    raw_did_document: Value,
+) -> std::result::Result<VerifiedWireDidDocument, ApiError> {
+    verify_did_document_proof_compatible_value_isolated(raw_did_document)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+fn verify_did_document_for_wire_blocking(
     raw_did_document: Value,
 ) -> std::result::Result<(), ApiError> {
     match verify_did_document_proof_standard_value_blocking(raw_did_document.clone()) {
@@ -2548,8 +2557,9 @@ fn verify_resource_did_document_for_wire(
 async fn verify_resource_and_publish_with_raw_document(
     state: AppState,
     request: ResourceVerifyAndPublishRequest,
-    raw_did_document: Value,
+    verified_did_document: VerifiedWireDidDocument,
 ) -> ApiResult<Value> {
+    let raw_did_document = verified_did_document.into_value();
     let admission_started = Instant::now();
     let _admission_permit = tokio::time::timeout(
         TokioDuration::from_secs(state.config.security.workers.http_timeout_seconds.max(1)),
@@ -2562,8 +2572,7 @@ async fn verify_resource_and_publish_with_raw_document(
     })?
     .map_err(ApiError::internal)?;
     record_admission_accepted(&state, admission_started.elapsed().as_millis());
-    verify_resource_request_with_raw_document(&state, &request, &raw_did_document)
-        .map_err(ApiError::bad_request)?;
+    verify_resource_request_with_envelope(&state, &request).map_err(ApiError::bad_request)?;
     ensure_governance_active(
         &state,
         GovernanceSubjectType::Registrar,
@@ -2599,6 +2608,7 @@ async fn verify_resource_and_publish_with_raw_document(
     }
     let verified_authority_binding =
         verify_controller_authorization_for_submission(&state, &request)
+            .await
             .map_err(ApiError::bad_request)?;
     metadata.metadata_hash = metadata_hash.clone();
     metadata.package_hash = request.submission.package_hash.clone();
@@ -4435,7 +4445,7 @@ fn validate_infrastructure_did_document_profile(
     did_document
         .validate_infrastructure_profile(expected_resource_type.clone())
         .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
-    verify_resource_did_document_for_wire(
+    verify_did_document_for_wire_blocking(
         serde_json::to_value(did_document).map_err(|_| "did_document_proof_invalid".to_owned())?,
     )
     .map_err(|_| "did_document_proof_invalid".to_owned())?;
@@ -5513,23 +5523,27 @@ async fn persist_verified_authority_binding(
 }
 
 
-fn verify_resource_request_with_raw_document(
+fn verify_resource_request_with_envelope(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
-    raw_did_document: &Value,
 ) -> std::result::Result<(), String> {
-    verify_resource_request_with_envelope_check(state, request, raw_did_document, |document, policy| {
+    verify_resource_request_with_envelope_check(state, request, |document, policy| {
         verify_signed_request_envelope(
-            &request.upstream_auth, &request.submission, &request.registrar_did,
-            document, policy, Utc::now(),
-        ).map(|_| ()).map_err(|err| err.to_string())
+            &request.upstream_auth,
+            &request.submission,
+            &request.registrar_did,
+            document,
+            policy,
+            Utc::now(),
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
     })
 }
 
 fn verify_resource_request_with_envelope_check(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
-    raw_did_document: &Value,
     check: impl FnOnce(&DidDocument, &TrustedUpstreamPolicy) -> std::result::Result<(), String>,
 ) -> std::result::Result<(), String> {
     let registrar_document = load_authorized_registrar_document(state, &request.registrar_did)
@@ -5537,13 +5551,11 @@ fn verify_resource_request_with_envelope_check(
     let policy = trusted_upstream_policy(state, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH);
     check(&registrar_document, &policy)?;
     request.submission.validate_shape()?;
-    verify_resource_did_document_for_wire(raw_did_document.clone())
-        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
 }
 
-fn verify_controller_authorization_for_submission(
+async fn verify_controller_authorization_for_submission(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
 ) -> std::result::Result<Option<VerifiedAuthorityBinding>, String> {
@@ -5568,6 +5580,7 @@ fn verify_controller_authorization_for_submission(
         serde_json::to_value(&bundle.controller_did_document)
             .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
     )
+    .await
     .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method_id = verify_controller_authorization_proof(

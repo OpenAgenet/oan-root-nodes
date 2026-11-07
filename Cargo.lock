@@ -2925,6 +2925,7 @@ dependencies = [
  "bs58 0.5.1",
  "chrono",
  "ed25519-dalek",
+ "flume",
  "futures",
  "hex",
  "iref",
