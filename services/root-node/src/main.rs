@@ -41,10 +41,11 @@ use oan_protocol::{
 };
 use oan_publication_events::{CdnPublishRequestedEvent, CdnPublishRequestedEventInput};
 use oan_service_security::{
-    bearer_token_from_header, hash_proof, request_id, verify_admin_token, verify_and_store_nonce,
-    verify_controller_authorization_proof, verify_signed_request_envelope, AdminAuthConfig,
-    AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
-    TrustedUpstreamPolicy,
+    bearer_token_from_header, hash_proof, request_id,
+    validate_signed_request_envelope_before_nonce, verify_admin_token, verify_and_store_nonce,
+    verify_controller_authorization_proof, verify_signed_request_envelope_after_nonce,
+    AdminAuthConfig, AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
+    SecurityError, TrustedUpstreamContext, TrustedUpstreamPolicy,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
@@ -69,6 +70,9 @@ use tokio::{
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 mod repository;
+mod request_nonce_store;
+
+use request_nonce_store::{RootRequestNonceBackend, RootRequestNonceStore};
 
 const ROOT_CDN_JOB_TABLE: &str = "root_cdn_publish_jobs";
 const ROOT_CDN_OUTBOX_TABLE: &str = "root_cdn_publish_outbox";
@@ -82,6 +86,9 @@ const ROOT_IDENTITY_RESOURCE_TABLE: &str = "root_identity_resources";
 const ROOT_IDENTITY_BINDING_TABLE: &str = "root_identity_bindings";
 const ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE: &str = "root_identity_bootstrap_state";
 const ROOT_IDENTITY_DIRECTORY_TABLE: &str = "root_identity_directory";
+const ROOT_REQUEST_NONCE_CLEANUP_BATCH: i64 = 1_000;
+const ROOT_REQUEST_NONCE_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+const ROOT_REQUEST_NONCE_CLEANUP_BACKLOG_INTERVAL_SECONDS: u64 = 1;
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
 const ROOT_STATUS_CACHE_TTL_MS: u64 = 500;
 const MAX_CDN_PUBLICATION_JOB_REQUESTS: usize = 100;
@@ -454,6 +461,7 @@ struct AppState {
     tag_tree: CapabilityTagTree,
     sqlite: Option<SqliteJsonStore>,
     postgres: Option<PostgresJsonStore>,
+    request_nonce_store: RootRequestNonceBackend,
     authorization_state: Arc<Mutex<AuthorizationState>>,
     client: reqwest::Client,
     trust_indexer_client: reqwest::Client,
@@ -1087,6 +1095,12 @@ async fn async_main() -> Result<()> {
         }
         _ => (None, None),
     };
+    let request_nonce_store = RootRequestNonceStore::connect_and_migrate(
+        &config.paths.request_nonce_file,
+        config.security.trusted_upstream.nonce_ttl_seconds,
+        Utc::now(),
+    )
+    .await?;
     let event_publisher = EventPublisher::from_config(&config.events).await?;
     let state = AppState {
         data,
@@ -1097,6 +1111,7 @@ async fn async_main() -> Result<()> {
             .unwrap_or_else(|_| default_tag_tree()),
         sqlite,
         postgres,
+        request_nonce_store: RootRequestNonceBackend::Sqlite(request_nonce_store),
         authorization_state: Arc::new(Mutex::new(authorization_state)),
         client: reqwest::Client::builder()
             .timeout(TokioDuration::from_secs(
@@ -1199,6 +1214,7 @@ async fn async_main() -> Result<()> {
         .with_state(state.clone());
 
     spawn_cdn_outbox_relay(state.clone());
+    spawn_request_nonce_cleanup(state.clone());
     if state.config.security.workers.enabled {
         spawn_root_background_workers(state.clone());
     }
@@ -1288,6 +1304,28 @@ fn trusted_upstream_policy(state: &AppState, expected_path: &str) -> TrustedUpst
     }
 }
 
+async fn verify_trusted_upstream_envelope<T: Serialize>(
+    state: &AppState,
+    envelope: &oan_protocol::SignedRequestEnvelope,
+    payload: &T,
+    signer_did: &str,
+    signer_document: &DidDocument,
+    policy: &TrustedUpstreamPolicy,
+) -> std::result::Result<TrustedUpstreamContext, SecurityError> {
+    let now = Utc::now();
+    validate_signed_request_envelope_before_nonce(envelope, policy, now)?;
+    state
+        .request_nonce_store
+        .claim(
+            &envelope.request_nonce,
+            envelope.request_timestamp,
+            now,
+            policy.nonce_ttl_seconds,
+        )
+        .await?;
+    verify_signed_request_envelope_after_nonce(envelope, payload, signer_did, signer_document)
+}
+
 fn require_admin(
     headers: &HeaderMap,
     state: &AppState,
@@ -1332,6 +1370,34 @@ fn spawn_root_background_workers(state: AppState) {
         tokio::spawn(async move {
             root_debug_export_loop(state).await;
         });
+    }
+}
+
+fn spawn_request_nonce_cleanup(state: AppState) {
+    tokio::spawn(async move {
+        let mut delay = request_nonce_cleanup_delay(0);
+        loop {
+            sleep(delay).await;
+            match state
+                .request_nonce_store
+                .cleanup_expired(Utc::now(), ROOT_REQUEST_NONCE_CLEANUP_BATCH)
+                .await
+            {
+                Ok(deleted) => delay = request_nonce_cleanup_delay(deleted),
+                Err(err) => {
+                    eprintln!("request nonce cleanup failed: {err}");
+                    delay = request_nonce_cleanup_delay(0);
+                }
+            }
+        }
+    });
+}
+
+fn request_nonce_cleanup_delay(deleted: u64) -> TokioDuration {
+    if deleted == ROOT_REQUEST_NONCE_CLEANUP_BATCH as u64 {
+        TokioDuration::from_secs(ROOT_REQUEST_NONCE_CLEANUP_BACKLOG_INTERVAL_SECONDS)
+    } else {
+        TokioDuration::from_secs(ROOT_REQUEST_NONCE_CLEANUP_INTERVAL_SECONDS)
     }
 }
 
@@ -2572,7 +2638,9 @@ async fn verify_resource_and_publish_with_raw_document(
     })?
     .map_err(ApiError::internal)?;
     record_admission_accepted(&state, admission_started.elapsed().as_millis());
-    verify_resource_request_with_envelope(&state, &request).map_err(ApiError::bad_request)?;
+    verify_resource_request_with_nonce_store(&state, &request)
+        .await
+        .map_err(ApiError::bad_request)?;
     ensure_governance_active(
         &state,
         GovernanceSubjectType::Registrar,
@@ -4276,14 +4344,15 @@ async fn validate_authorization_vc_issue_request(
         nonce_ttl_seconds: state.config.security.trusted_upstream.nonce_ttl_seconds,
         nonce_store_path: state.config.paths.request_nonce_file.clone(),
     };
-    verify_signed_request_envelope(
+    verify_trusted_upstream_envelope(
+        state,
         &request.upstream_auth,
         &request.payload,
         &request.payload.subject_did,
         &request.payload.did_document,
         &policy,
-        Utc::now(),
     )
+    .await
     .map_err(|err| err.to_string())?;
     if matches!(
         subject_type,
@@ -5522,38 +5591,30 @@ async fn persist_verified_authority_binding(
     Ok(())
 }
 
-
-fn verify_resource_request_with_envelope(
+async fn verify_resource_request_with_nonce_store(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
-) -> std::result::Result<(), String> {
-    verify_resource_request_with_envelope_check(state, request, |document, policy| {
-        verify_signed_request_envelope(
-            &request.upstream_auth,
-            &request.submission,
-            &request.registrar_did,
-            document,
-            policy,
-            Utc::now(),
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-    })
-}
-
-fn verify_resource_request_with_envelope_check(
-    state: &AppState,
-    request: &ResourceVerifyAndPublishRequest,
-    check: impl FnOnce(&DidDocument, &TrustedUpstreamPolicy) -> std::result::Result<(), String>,
 ) -> std::result::Result<(), String> {
     let registrar_document = load_authorized_registrar_document(state, &request.registrar_did)
         .map_err(|_| "registrar_not_authorized".to_owned())?;
     let policy = trusted_upstream_policy(state, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH);
-    check(&registrar_document, &policy)?;
+    verify_trusted_upstream_envelope(
+        state,
+        &request.upstream_auth,
+        &request.submission,
+        &request.registrar_did,
+        &registrar_document,
+        &policy,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
     validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
 }
+
+
+
 
 async fn verify_controller_authorization_for_submission(
     state: &AppState,
