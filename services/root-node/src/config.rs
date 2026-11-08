@@ -373,6 +373,12 @@ pub(super) fn load_config_details(
     if config.events.backend != "nats-jetstream" {
         return Err(anyhow!("unsupported_event_backend (value hidden)"));
     }
+    use async_nats::ToServerAddrs;
+    config
+        .events
+        .endpoint
+        .to_server_addrs()
+        .map_err(|_| anyhow!("invalid events.endpoint (value hidden)"))?;
     if config.server.host.trim().is_empty() {
         return Err(anyhow::anyhow!("server.host is required"));
     }
