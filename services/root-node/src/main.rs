@@ -127,7 +127,7 @@ struct AppState {
     config: Config,
     root_did: String,
     signing_key: SigningKey,
-    tag_tree: CapabilityTagTree,
+    tag_tree: Arc<CapabilityTagTree>,
     sqlite: Option<SqliteJsonStore>,
     postgres: Option<PostgresJsonStore>,
     request_nonce_store: RootRequestNonceBackend,
@@ -801,8 +801,10 @@ async fn async_main(config: Config) -> Result<()> {
         config: config.clone(),
         root_did: identity.did,
         signing_key,
-        tag_tree: oan_core::CapabilityTagTree::load_from_path(&config.paths.capability_tree_file)
-            .unwrap_or_else(|_| default_tag_tree()),
+        tag_tree: Arc::new(
+            oan_core::CapabilityTagTree::load_from_path(&config.paths.capability_tree_file)
+                .unwrap_or_else(|_| default_tag_tree()),
+        ),
         sqlite,
         postgres,
         request_nonce_store: RootRequestNonceBackend::Sqlite(request_nonce_store),
@@ -3750,7 +3752,7 @@ async fn api_discovery_notify_queue(State(state): State<AppState>) -> ApiResult<
 }
 
 async fn api_capability_tree(State(state): State<AppState>) -> ApiResult<CapabilityTagTree> {
-    Ok(Json(state.tag_tree.clone()))
+    Ok(Json(state.tag_tree.as_ref().clone()))
 }
 
 async fn api_validate_tags(
