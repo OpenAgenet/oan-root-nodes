@@ -3,6 +3,10 @@
 // Initial author: JINLIANG XU
 // Email: jlxufly@gmail.com
 
+mod config;
+mod runtime_config;
+use config::*;
+
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{Path as AxumPath, Query, State},
@@ -56,9 +60,8 @@ use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
 use std::{
     collections::BTreeMap,
-    env,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
@@ -96,184 +99,10 @@ const MAX_CDN_PUBLICATION_JOB_KEY_BYTES: usize = 2048;
 const MAX_CDN_PUBLICATION_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CDN_PUBLICATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
-struct Config {
-    server: ServerConfig,
-    #[serde(default)]
-    cors: CorsConfig,
-    #[serde(default)]
-    debug: DebugConfig,
-    #[serde(default)]
-    events: EventStreamConfig,
-    #[serde(default)]
-    security: SecurityConfig,
-    paths: PathConfig,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ServerConfig {
-    host: String,
-    port: u16,
-    #[serde(default)]
-    endpoint: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 struct CredentialStatusQuery {
     subject_did: Option<String>,
     credential_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct CorsConfig {
-    #[serde(default)]
-    allowed_origins: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DebugConfig {
-    #[serde(default)]
-    export_snapshots: bool,
-    #[serde(default = "default_debug_export_interval_ms")]
-    export_interval_ms: u64,
-}
-
-impl Default for DebugConfig {
-    fn default() -> Self {
-        Self {
-            export_snapshots: false,
-            export_interval_ms: default_debug_export_interval_ms(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct EventStreamConfig {
-    #[serde(default = "default_event_enabled")]
-    enabled: bool,
-    #[serde(default = "default_event_backend")]
-    backend: String,
-    #[serde(default = "default_event_endpoint")]
-    endpoint: String,
-    #[serde(default = "default_event_stream")]
-    stream: String,
-    #[serde(default = "default_cdn_publish_subject")]
-    cdn_publish_subject: String,
-    #[serde(default = "default_event_publish_timeout_ms")]
-    publish_timeout_ms: u64,
-    #[serde(default = "default_event_failure_mode")]
-    failure_mode: String,
-}
-
-impl Default for EventStreamConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_event_enabled(),
-            backend: default_event_backend(),
-            endpoint: default_event_endpoint(),
-            stream: default_event_stream(),
-            cdn_publish_subject: default_cdn_publish_subject(),
-            publish_timeout_ms: default_event_publish_timeout_ms(),
-            failure_mode: default_event_failure_mode(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct SecurityConfig {
-    #[serde(default)]
-    admin: AdminSecurityConfig,
-    #[serde(default)]
-    trusted_upstream: TrustedUpstreamSecurityConfig,
-    #[serde(default)]
-    workers: WorkerSecurityConfig,
-    #[serde(default)]
-    trust_indexer: TrustIndexerConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AdminSecurityConfig {
-    #[serde(default = "default_admin_mode")]
-    mode: String,
-    #[serde(default)]
-    static_tokens: Vec<String>,
-    #[serde(default)]
-    trusted_admin_dids: Vec<String>,
-    #[serde(default = "default_clock_skew_seconds")]
-    max_clock_skew_seconds: i64,
-    #[serde(default = "default_nonce_ttl_seconds")]
-    nonce_ttl_seconds: i64,
-    #[serde(default = "default_admin_nonce_file")]
-    nonce_store_file: PathBuf,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct TrustedUpstreamSecurityConfig {
-    #[serde(default = "default_clock_skew_seconds")]
-    max_clock_skew_seconds: i64,
-    #[serde(default = "default_nonce_ttl_seconds")]
-    nonce_ttl_seconds: i64,
-}
-
-impl Default for TrustedUpstreamSecurityConfig {
-    fn default() -> Self {
-        Self {
-            max_clock_skew_seconds: default_clock_skew_seconds(),
-            nonce_ttl_seconds: default_nonce_ttl_seconds(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct TrustIndexerConfig {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default = "default_trust_indexer_fail_mode")]
-    fail_mode: String,
-    #[serde(default = "default_trust_indexer_timeout_ms")]
-    timeout_ms: u64,
-    #[serde(default = "default_trust_indexer_poll_interval_ms")]
-    poll_interval_ms: u64,
-}
-
-impl Default for TrustIndexerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            endpoint: Some("http://127.0.0.1:8088".to_owned()),
-            fail_mode: default_trust_indexer_fail_mode(),
-            timeout_ms: default_trust_indexer_timeout_ms(),
-            poll_interval_ms: default_trust_indexer_poll_interval_ms(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct WorkerSecurityConfig {
-    #[serde(default = "default_worker_enabled")]
-    enabled: bool,
-    #[serde(default = "default_cdn_worker_interval_ms")]
-    cdn_interval_ms: u64,
-    #[serde(default = "default_discovery_worker_interval_ms")]
-    discovery_interval_ms: u64,
-    #[serde(default = "default_cdn_worker_batch_size")]
-    cdn_batch_size: usize,
-    #[serde(default = "default_discovery_worker_batch_size")]
-    discovery_batch_size: usize,
-    #[serde(default = "default_cdn_worker_concurrency")]
-    cdn_concurrency: usize,
-    #[serde(default = "default_discovery_worker_concurrency")]
-    discovery_concurrency: usize,
-    #[serde(default = "default_root_admission_concurrency")]
-    admission_concurrency: usize,
-    #[serde(default = "default_worker_lease_seconds")]
-    lease_seconds: i64,
-    #[serde(default = "default_worker_retry_backoff_seconds")]
-    retry_backoff_seconds: i64,
-    #[serde(default = "default_worker_http_timeout_seconds")]
-    http_timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -291,166 +120,6 @@ struct BulletinEventsQuery {
 
 const ROOT_DEFAULT_PAGE_SIZE: u32 = 100;
 const ROOT_MAX_PAGE_SIZE: u32 = 500;
-
-impl Default for WorkerSecurityConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_worker_enabled(),
-            cdn_interval_ms: default_cdn_worker_interval_ms(),
-            discovery_interval_ms: default_discovery_worker_interval_ms(),
-            cdn_batch_size: default_cdn_worker_batch_size(),
-            discovery_batch_size: default_discovery_worker_batch_size(),
-            cdn_concurrency: default_cdn_worker_concurrency(),
-            discovery_concurrency: default_discovery_worker_concurrency(),
-            admission_concurrency: default_root_admission_concurrency(),
-            lease_seconds: default_worker_lease_seconds(),
-            retry_backoff_seconds: default_worker_retry_backoff_seconds(),
-            http_timeout_seconds: default_worker_http_timeout_seconds(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PathConfig {
-    data_dir: PathBuf,
-    #[serde(default = "default_identity_file")]
-    identity_file: PathBuf,
-    bulletin_file: PathBuf,
-    #[serde(default = "default_authorization_state_file")]
-    authorization_state_file: PathBuf,
-    #[serde(default = "default_request_nonce_file")]
-    request_nonce_file: PathBuf,
-    #[serde(default = "default_controller_authorization_nonce_file")]
-    controller_authorization_nonce_file: PathBuf,
-    #[serde(default = "default_capability_tree_file")]
-    capability_tree_file: PathBuf,
-    #[serde(default)]
-    database_url: Option<String>,
-}
-
-fn default_identity_file() -> PathBuf {
-    PathBuf::from("../../data/root/identity.json")
-}
-
-fn default_authorization_state_file() -> PathBuf {
-    PathBuf::from("../../data/root/authorization-state.json")
-}
-
-fn default_request_nonce_file() -> PathBuf {
-    PathBuf::from("../../data/root/request-nonces.json")
-}
-
-fn default_controller_authorization_nonce_file() -> PathBuf {
-    PathBuf::from("../../data/root/controller-authorization-nonces.json")
-}
-
-fn default_admin_nonce_file() -> PathBuf {
-    PathBuf::from("../../data/root/admin-request-nonces.json")
-}
-
-fn default_capability_tree_file() -> PathBuf {
-    PathBuf::from("../../docs/capability-tree-v1.json")
-}
-
-fn default_admin_mode() -> String {
-    "static-token".to_owned()
-}
-
-fn default_event_backend() -> String {
-    "nats-jetstream".to_owned()
-}
-
-fn default_event_endpoint() -> String {
-    "nats://127.0.0.1:4222".to_owned()
-}
-
-fn default_event_stream() -> String {
-    "OAN_RESOURCE_PUBLICATION".to_owned()
-}
-
-fn default_cdn_publish_subject() -> String {
-    "oan.resource.cdn.publish.requested".to_owned()
-}
-
-fn default_event_enabled() -> bool {
-    true
-}
-
-fn default_event_publish_timeout_ms() -> u64 {
-    1_000
-}
-
-fn default_event_failure_mode() -> String {
-    "fallback".to_owned()
-}
-
-fn default_worker_enabled() -> bool {
-    true
-}
-
-fn default_cdn_worker_interval_ms() -> u64 {
-    1_000
-}
-
-fn default_discovery_worker_interval_ms() -> u64 {
-    1_500
-}
-
-fn default_cdn_worker_batch_size() -> usize {
-    200
-}
-
-fn default_discovery_worker_batch_size() -> usize {
-    100
-}
-
-fn default_cdn_worker_concurrency() -> usize {
-    16
-}
-
-fn default_discovery_worker_concurrency() -> usize {
-    8
-}
-
-fn default_root_admission_concurrency() -> usize {
-    64
-}
-
-fn default_worker_lease_seconds() -> i64 {
-    60
-}
-
-fn default_worker_retry_backoff_seconds() -> i64 {
-    15
-}
-
-fn default_worker_http_timeout_seconds() -> u64 {
-    10
-}
-
-fn default_debug_export_interval_ms() -> u64 {
-    ROOT_DEBUG_EXPORT_INTERVAL_MS
-}
-
-fn default_trust_indexer_fail_mode() -> String {
-    "closed".to_owned()
-}
-
-fn default_trust_indexer_timeout_ms() -> u64 {
-    500
-}
-
-fn default_trust_indexer_poll_interval_ms() -> u64 {
-    3_000
-}
-
-fn default_clock_skew_seconds() -> i64 {
-    300
-}
-
-fn default_nonce_ttl_seconds() -> i64 {
-    300
-}
 
 #[derive(Clone)]
 struct AppState {
@@ -1050,18 +719,35 @@ struct DiscoveryNotificationTargetItem {
 }
 
 fn main() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async { tokio::spawn(async_main()).await? })
+    let cli = oan_config::NodeCli::parse();
+    if matches!(
+        cli.command,
+        Some(
+            oan_config::NodeCommand::SemanticRebuild(_)
+                | oan_config::NodeCommand::SemanticBackfillSkipped(_)
+                | oan_config::NodeCommand::SemanticEvaluate(_)
+                | oan_config::NodeCommand::SemanticRebuildEvaluate(_)
+        )
+    ) {
+        return Err(anyhow!(
+            "semantic commands are supported only by discovery-node"
+        ));
+    }
+    if cli.legacy_config.is_some() {
+        eprintln!("deprecated positional configuration path; use --config");
+    }
+    let path = cli.path("services/root-node/config.example.toml")?;
+    let (config, sources) = load_config_details(path.to_string_lossy().into_owned())?;
+    if cli.inspect(&config, &sources)? {
+        return Ok(());
+    }
+    let runtime = config.runtime.build()?;
+    oan_crypto::initialize_did_verification_executor(config.runtime.did_verification)
+        .map_err(|e| anyhow!(e))?;
+    runtime.block_on(async { tokio::spawn(async_main(config)).await? })
 }
 
-async fn async_main() -> Result<()> {
-    let config_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "services/root-node/config.example.toml".to_owned());
-    let config = load_config(config_path)?;
+async fn async_main(config: Config) -> Result<()> {
     let data = JsonStore::new(&config.paths.data_dir);
     let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
     identity
@@ -1082,12 +768,20 @@ async fn async_main() -> Result<()> {
             let database = DatabaseConfig::parse(url)?;
             match database.backend() {
                 DatabaseBackend::Sqlite => {
-                    let sqlite = SqliteJsonStore::connect(url).await?;
+                    let sqlite = SqliteJsonStore::connect_with_pool(
+                        url,
+                        &runtime_config::pool_options(&config.database.pool, url)?,
+                    )
+                    .await?;
                     initialize_root_sqlite(&sqlite).await?;
                     (Some(sqlite), None)
                 }
                 DatabaseBackend::Postgres => {
-                    let postgres = PostgresJsonStore::connect(url).await?;
+                    let postgres = PostgresJsonStore::connect_with_pool(
+                        url,
+                        &runtime_config::pool_options(&config.database.pool, url)?,
+                    )
+                    .await?;
                     initialize_root_postgres(&postgres).await?;
                     (None, Some(postgres))
                 }
@@ -1229,36 +923,6 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-fn load_config(path: String) -> Result<Config> {
-    let path = PathBuf::from(path);
-    let text = std::fs::read_to_string(&path)?;
-    let mut config: Config = toml::from_str(&text)?;
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
-    config.paths.identity_file = resolve_relative(base, &config.paths.identity_file);
-    config.paths.bulletin_file = resolve_relative(base, &config.paths.bulletin_file);
-    config.paths.authorization_state_file =
-        resolve_relative(base, &config.paths.authorization_state_file);
-    config.paths.request_nonce_file = resolve_relative(base, &config.paths.request_nonce_file);
-    config.paths.controller_authorization_nonce_file =
-        resolve_relative(base, &config.paths.controller_authorization_nonce_file);
-    config.security.admin.nonce_store_file =
-        resolve_relative(base, &config.security.admin.nonce_store_file);
-    if !config.paths.capability_tree_file.as_os_str().is_empty() {
-        config.paths.capability_tree_file =
-            resolve_relative(base, &config.paths.capability_tree_file);
-    }
-    if let Some(database_url) = config.paths.database_url.as_mut() {
-        *database_url = resolve_database_url(base, database_url);
-    }
-    if !config.events.enabled {
-        return Err(anyhow!(
-            "root_cdn_event_stream_required: Root-to-CDN publication no longer supports the legacy Root DB worker path; set [events].enabled=true"
-        ));
-    }
-    Ok(config)
-}
-
 fn admin_auth_config(state: &AppState) -> AdminAuthConfig {
     match state.config.security.admin.mode.as_str() {
         "signed-did" => {
@@ -1339,14 +1003,6 @@ fn require_admin(
         status: StatusCode::UNAUTHORIZED,
         message: err.to_string(),
     })
-}
-
-fn resolve_relative(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
 }
 
 fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer> {
@@ -2142,17 +1798,6 @@ fn mark_local_governance_inactive(
         reason
     );
     Ok(())
-}
-
-fn resolve_database_url(base: &Path, url: &str) -> String {
-    let Some(raw_path) = url
-        .strip_prefix("sqlite://")
-        .or_else(|| url.strip_prefix("sqlite:"))
-    else {
-        return url.to_owned();
-    };
-    let resolved = resolve_relative(base, Path::new(raw_path));
-    format!("sqlite:{}", resolved.display())
 }
 
 async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
