@@ -520,6 +520,123 @@ pub(super) async fn latest_resource_detail_impl(
     Ok(None)
 }
 
+pub(super) async fn current_accepted_resource_state_impl(
+    state: &AppState,
+    did: &str,
+) -> Result<Option<CurrentAcceptedResourceState>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT latest.current_version,
+                   latest.did_document_hash,
+                   latest.metadata_hash,
+                   latest.current_controller_did,
+                   latest.control_revision,
+                   latest.continuity_status,
+                   versions.package_json
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = ?
+            "#
+        ))
+        .bind(did)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return row
+            .map(|row| {
+                let continuity_status = row.get::<String, _>(5);
+                if continuity_status != "ready" {
+                    return Err(anyhow::anyhow!("resource_continuity_state_frozen"));
+                }
+                let current_controller_did = row
+                    .get::<Option<String>, _>(3)
+                    .ok_or_else(|| anyhow::anyhow!("resource_continuity_state_missing"))?;
+                Ok(CurrentAcceptedResourceState {
+                    resource_did: did.to_owned(),
+                    current_version: row.get(0),
+                    did_document_hash: row.get(1),
+                    metadata_hash: row.get(2),
+                    current_controller_did,
+                    control_revision: row.get(4),
+                    package: serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(6))?,
+                })
+            })
+            .transpose();
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT latest.current_version,
+                   latest.did_document_hash,
+                   latest.metadata_hash,
+                   latest.current_controller_did,
+                   latest.control_revision,
+                   latest.continuity_status,
+                   versions.package_json::text
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = $1
+            "#
+        ))
+        .bind(did)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return row
+            .map(|row| {
+                let continuity_status = row.get::<String, _>(5);
+                if continuity_status != "ready" {
+                    return Err(anyhow::anyhow!("resource_continuity_state_frozen"));
+                }
+                let current_controller_did = row
+                    .get::<Option<String>, _>(3)
+                    .ok_or_else(|| anyhow::anyhow!("resource_continuity_state_missing"))?;
+                Ok(CurrentAcceptedResourceState {
+                    resource_did: did.to_owned(),
+                    current_version: row.get(0),
+                    did_document_hash: row.get(1),
+                    metadata_hash: row.get(2),
+                    current_controller_did,
+                    control_revision: row.get(4),
+                    package: serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(6))?,
+                })
+            })
+            .transpose();
+    }
+    let latest = super::read_latest_versions(state)?;
+    let Some(latest_entry) = latest.get(did) else {
+        return Ok(None);
+    };
+    let package_version = latest_entry
+        .get("packageVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("resource_continuity_state_missing"))?;
+    let package_name = super::did_to_file_name(did);
+    let package = state
+        .data
+        .read::<ResourcePackage>(format!("resource-packages/{package_name}"))
+        .or_else(|_| {
+            state.data.read::<ResourcePackage>(format!(
+                "resources/{}/{}/resource-package.json",
+                package_name.trim_end_matches(".json"),
+                package_version
+            ))
+        })?;
+    let current_controller_did = package.did_document.registration_controller()?.0;
+    Ok(Some(CurrentAcceptedResourceState {
+        resource_did: did.to_owned(),
+        current_version: package_version.to_owned(),
+        did_document_hash: package.did_document_hash.clone(),
+        metadata_hash: package.metadata_hash.clone(),
+        current_controller_did,
+        control_revision: 1,
+        package,
+    }))
+}
+
 pub(super) fn sync_discovery_target_state_impl(
     state: &AppState,
     did: &str,
@@ -666,9 +783,19 @@ pub(super) fn sync_discovery_target_state_impl(
     Ok(())
 }
 
-pub(super) async fn persist_resource_acceptance_impl(
+
+pub(super) async fn persist_resource_transition_impl(
     state: &AppState,
     package: &ResourcePackage,
+    transition: &ResourceAcceptanceTransition,
+) -> Result<()> {
+    persist_resource_acceptance_inner(state, package, Some(transition)).await
+}
+
+async fn persist_resource_acceptance_inner(
+    state: &AppState,
+    package: &ResourcePackage,
+    transition: Option<&ResourceAcceptanceTransition>,
 ) -> Result<()> {
     let accepted_at = Utc::now();
     let resource_did = &package.resource_did;
@@ -686,63 +813,177 @@ pub(super) async fn persist_resource_acceptance_impl(
         let next_attempt_at = now.clone();
         let mut tx = sqlite.pool().begin().await?;
 
-        if let Some(existing_hash) = sqlx::query_scalar::<_, String>(&format!(
-            "SELECT did_document_hash FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = ? AND version = ?"
+        if let Some(transition) = transition {
+            for authorization in &transition.authorizations {
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {ROOT_PROOF_NONCE_TABLE}(
+                        proof_kind, signer_did, nonce, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    "#
+                ))
+                .bind(authorization.proof_kind)
+                .bind(&authorization.authorizer_did)
+                .bind(&authorization.proof_nonce)
+                .bind(authorization.expires_at.to_rfc3339())
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    if error.to_string().contains("UNIQUE constraint failed") {
+                        anyhow::anyhow!("proof_nonce_replayed")
+                    } else {
+                        error.into()
+                    }
+                })?;
+            }
+            for dependency in &transition.dependencies {
+                let row = sqlx::query(&format!(
+                    "SELECT current_version, did_document_hash, control_revision FROM {ROOT_SUBJECT_LATEST_TABLE} WHERE subject_did = ?"
+                ))
+                .bind(&dependency.resource_did)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let matches = row
+                    .map(|row| {
+                        row.get::<String, _>(0) == dependency.current_version
+                            && row.get::<String, _>(1) == dependency.did_document_hash
+                            && row.get::<i64, _>(2) == dependency.control_revision
+                    })
+                    .unwrap_or(false);
+                if !matches {
+                    return Err(anyhow::anyhow!("controller_state_changed"));
+                }
+            }
+        }
+
+        if let Some(existing) = sqlx::query(&format!(
+            "SELECT did_document_hash, metadata_hash, package_hash FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = ? AND version = ?"
         ))
         .bind(resource_did)
         .bind(version)
         .fetch_optional(&mut *tx)
         .await?
         {
-            if existing_hash != package.did_document_hash {
+            if existing.get::<String, _>(0) != package.did_document_hash
+                || existing.get::<String, _>(1) != package.metadata_hash
+                || existing.get::<String, _>(2) != package.package_hash
+            {
                 return Err(anyhow::anyhow!("resource_version_conflict"));
             }
+            if transition.is_none() {
+                return Ok(());
+            }
+            let latest_matches = sqlx::query(&format!(
+                "SELECT 1 FROM {ROOT_SUBJECT_LATEST_TABLE} WHERE subject_did = ? AND current_version = ? AND did_document_hash = ? AND metadata_hash = ?"
+            ))
+            .bind(resource_did)
+            .bind(version)
+            .bind(&package.did_document_hash)
+            .bind(&package.metadata_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if latest_matches {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("resource_version_conflict"));
         }
 
         sqlx::query(&format!(
             r#"
-            INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(subject_did, version, did_document_hash, metadata_hash, package_json, archive_path, accepted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(subject_did, version)
-            DO UPDATE SET
-                did_document_hash = excluded.did_document_hash,
-                metadata_hash = excluded.metadata_hash,
-                package_json = excluded.package_json,
-                archive_path = excluded.archive_path,
-                accepted_at = excluded.accepted_at
+            INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(subject_did, version, did_document_hash, metadata_hash, package_hash, package_json, archive_path, accepted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#
         ))
         .bind(resource_did)
         .bind(version)
         .bind(&package.did_document_hash)
         .bind(&package.metadata_hash)
+        .bind(&package.package_hash)
         .bind(&package_json)
         .bind(&archive_path)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {ROOT_SUBJECT_LATEST_TABLE}(subject_did, current_version, did_document_hash, metadata_hash, operation, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(subject_did)
-            DO UPDATE SET
-                current_version = excluded.current_version,
-                did_document_hash = excluded.did_document_hash,
-                metadata_hash = excluded.metadata_hash,
-                operation = excluded.operation,
-                updated_at = excluded.updated_at
-            "#
-        ))
-        .bind(resource_did)
-        .bind(version)
-        .bind(&package.did_document_hash)
-        .bind(&package.metadata_hash)
-        .bind(operation)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+        if let Some(transition) = transition {
+            let affected = if let Some(current) = transition.expected_current.as_ref() {
+                sqlx::query(&format!(
+                    r#"
+                    UPDATE {ROOT_SUBJECT_LATEST_TABLE}
+                    SET current_version = ?, did_document_hash = ?, metadata_hash = ?,
+                        current_controller_did = ?, control_revision = control_revision + 1,
+                        continuity_status = 'ready', continuity_error = NULL,
+                        operation = ?, updated_at = ?
+                    WHERE subject_did = ? AND current_version = ?
+                      AND did_document_hash = ? AND control_revision = ?
+                    "#
+                ))
+                .bind(version)
+                .bind(&package.did_document_hash)
+                .bind(&package.metadata_hash)
+                .bind(&transition.next_controller_did)
+                .bind(operation)
+                .bind(&now)
+                .bind(resource_did)
+                .bind(&current.current_version)
+                .bind(&current.did_document_hash)
+                .bind(current.control_revision)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+            } else {
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {ROOT_SUBJECT_LATEST_TABLE}(
+                        subject_did, current_version, did_document_hash, metadata_hash,
+                        current_controller_did, control_revision, continuity_status,
+                        operation, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, 'ready', ?, ?)
+                    ON CONFLICT(subject_did) DO NOTHING
+                    "#
+                ))
+                .bind(resource_did)
+                .bind(version)
+                .bind(&package.did_document_hash)
+                .bind(&package.metadata_hash)
+                .bind(&transition.next_controller_did)
+                .bind(operation)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+            };
+            if affected != 1 {
+                return Err(anyhow::anyhow!("resource_previous_state_conflict"));
+            }
+        } else {
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {ROOT_SUBJECT_LATEST_TABLE}(subject_did, current_version, did_document_hash, metadata_hash, current_controller_did, control_revision, continuity_status, operation, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, 'ready', ?, ?)
+                ON CONFLICT(subject_did)
+                DO UPDATE SET
+                    current_version = excluded.current_version,
+                    did_document_hash = excluded.did_document_hash,
+                    metadata_hash = excluded.metadata_hash,
+                    current_controller_did = excluded.current_controller_did,
+                    control_revision = {ROOT_SUBJECT_LATEST_TABLE}.control_revision + 1,
+                    operation = excluded.operation,
+                    updated_at = excluded.updated_at
+                "#
+            ))
+            .bind(resource_did)
+            .bind(version)
+            .bind(&package.did_document_hash)
+            .bind(&package.metadata_hash)
+            .bind(package.did_document.registration_controller()?.0)
+            .bind(operation)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         let publication_cursor = sqlx::query(&format!(
             "SELECT rowid FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = ? AND version = ?"
@@ -818,6 +1059,93 @@ pub(super) async fn persist_resource_acceptance_impl(
         .execute(&mut *tx)
         .await?;
 
+        if let Some(transition) = transition {
+            sqlx::query(&format!(
+                "UPDATE {ROOT_IDENTITY_BINDING_TABLE} SET status = 'superseded', updated_at = ? WHERE resource_did = ? AND status = 'active'"
+            ))
+            .bind(&now)
+            .bind(resource_did)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(binding) = transition.next_binding.as_ref() {
+                let public_key_jwk = binding
+                    .public_key_jwk
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?;
+                let authorization = transition.authorizations.last();
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {ROOT_IDENTITY_BINDING_TABLE}(
+                        controller_did, resource_did, verification_method, public_key_jwk,
+                        public_key_multibase, accepted_at, status, authorized_by_did,
+                        authorization_proof_hash, package_version, binding_source, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 'verified-transition', ?)
+                    ON CONFLICT(controller_did, resource_did, verification_method)
+                    DO UPDATE SET
+                        public_key_jwk = excluded.public_key_jwk,
+                        public_key_multibase = excluded.public_key_multibase,
+                        accepted_at = excluded.accepted_at,
+                        status = 'active',
+                        authorized_by_did = excluded.authorized_by_did,
+                        authorization_proof_hash = excluded.authorization_proof_hash,
+                        package_version = excluded.package_version,
+                        binding_source = excluded.binding_source,
+                        updated_at = excluded.updated_at
+                    "#
+                ))
+                .bind(&binding.controller_did)
+                .bind(resource_did)
+                .bind(&binding.verification_method)
+                .bind(public_key_jwk)
+                .bind(&binding.public_key_multibase)
+                .bind(binding.accepted_at.to_rfc3339())
+                .bind(authorization.map(|value| value.authorizer_did.as_str()))
+                .bind(authorization.map(|value| value.proof_hash.as_str()))
+                .bind(version)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let authorizations_json = serde_json::to_string(&transition.authorizations)?;
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {ROOT_TRANSITION_AUDIT_TABLE}(
+                    resource_did, package_version, request_id, previous_version,
+                    previous_hash, next_hash, previous_controller_did,
+                    next_controller_did, authorizations_json, transition_source, accepted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified-transition', ?)
+                "#
+            ))
+            .bind(resource_did)
+            .bind(version)
+            .bind(&transition.request_id)
+            .bind(
+                transition
+                    .expected_current
+                    .as_ref()
+                    .map(|value| value.current_version.as_str()),
+            )
+            .bind(
+                transition
+                    .expected_current
+                    .as_ref()
+                    .map(|value| value.did_document_hash.as_str()),
+            )
+            .bind(&package.did_document_hash)
+            .bind(
+                transition
+                    .expected_current
+                    .as_ref()
+                    .map(|value| value.current_controller_did.as_str()),
+            )
+            .bind(&transition.next_controller_did)
+            .bind(authorizations_json)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
         return Ok(());
     }
@@ -838,17 +1166,86 @@ pub(super) async fn persist_resource_acceptance_impl(
 
         let mut tx = postgres.pool().begin().await?;
 
-        if let Some(existing_hash) = sqlx::query_scalar::<_, String>(&format!(
-            "SELECT did_document_hash FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = $1 AND version = $2"
+        if let Some(transition) = transition {
+            for authorization in &transition.authorizations {
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {ROOT_PROOF_NONCE_TABLE}(
+                        proof_kind, signer_did, nonce, expires_at, created_at
+                    ) VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz)
+                    "#
+                ))
+                .bind(authorization.proof_kind)
+                .bind(&authorization.authorizer_did)
+                .bind(&authorization.proof_nonce)
+                .bind(authorization.expires_at.to_rfc3339())
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    if error
+                        .as_database_error()
+                        .and_then(|value| value.code())
+                        .as_deref()
+                        == Some("23505")
+                    {
+                        anyhow::anyhow!("proof_nonce_replayed")
+                    } else {
+                        error.into()
+                    }
+                })?;
+            }
+            for dependency in &transition.dependencies {
+                let row = sqlx::query(&format!(
+                    "SELECT current_version, did_document_hash, control_revision FROM {ROOT_SUBJECT_LATEST_TABLE} WHERE subject_did = $1 FOR SHARE"
+                ))
+                .bind(&dependency.resource_did)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let matches = row
+                    .map(|row| {
+                        row.get::<String, _>(0) == dependency.current_version
+                            && row.get::<String, _>(1) == dependency.did_document_hash
+                            && row.get::<i64, _>(2) == dependency.control_revision
+                    })
+                    .unwrap_or(false);
+                if !matches {
+                    return Err(anyhow::anyhow!("controller_state_changed"));
+                }
+            }
+        }
+
+        if let Some(existing) = sqlx::query(&format!(
+            "SELECT did_document_hash, metadata_hash, package_hash FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = $1 AND version = $2"
         ))
         .bind(resource_did)
         .bind(version)
         .fetch_optional(&mut *tx)
         .await?
         {
-            if existing_hash != package.did_document_hash {
+            if existing.get::<String, _>(0) != package.did_document_hash
+                || existing.get::<String, _>(1) != package.metadata_hash
+                || existing.get::<String, _>(2) != package.package_hash
+            {
                 return Err(anyhow::anyhow!("resource_version_conflict"));
             }
+            if transition.is_none() {
+                return Ok(());
+            }
+            let latest_matches = sqlx::query(&format!(
+                "SELECT 1 FROM {ROOT_SUBJECT_LATEST_TABLE} WHERE subject_did = $1 AND current_version = $2 AND did_document_hash = $3 AND metadata_hash = $4"
+            ))
+            .bind(resource_did)
+            .bind(version)
+            .bind(&package.did_document_hash)
+            .bind(&package.metadata_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if latest_matches {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("resource_version_conflict"));
         }
 
         let publication_cursor = sqlx::query(&format!(
@@ -858,17 +1255,6 @@ pub(super) async fn persist_resource_acceptance_impl(
                 capability_tags_json, authorized_domains_json, package_json, archive_path, accepted_at
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11::timestamptz)
-            ON CONFLICT(subject_did, version)
-            DO UPDATE SET
-                did_document_hash = excluded.did_document_hash,
-                metadata_hash = excluded.metadata_hash,
-                package_hash = excluded.package_hash,
-                resource_type = excluded.resource_type,
-                capability_tags_json = excluded.capability_tags_json,
-                authorized_domains_json = excluded.authorized_domains_json,
-                package_json = excluded.package_json,
-                archive_path = excluded.archive_path,
-                accepted_at = excluded.accepted_at
             RETURNING publication_cursor
             "#
         ))
@@ -887,27 +1273,83 @@ pub(super) async fn persist_resource_acceptance_impl(
         .await?
         .get::<i64, _>(0);
 
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {ROOT_SUBJECT_LATEST_TABLE}(subject_did, current_version, did_document_hash, metadata_hash, operation, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
-            ON CONFLICT(subject_did)
-            DO UPDATE SET
-                current_version = excluded.current_version,
-                did_document_hash = excluded.did_document_hash,
-                metadata_hash = excluded.metadata_hash,
-                operation = excluded.operation,
-                updated_at = excluded.updated_at
-            "#
-        ))
-        .bind(resource_did)
-        .bind(version)
-        .bind(&package.did_document_hash)
-        .bind(&package.metadata_hash)
-        .bind(operation)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+        if let Some(transition) = transition {
+            let affected = if let Some(current) = transition.expected_current.as_ref() {
+                sqlx::query(&format!(
+                    r#"
+                    UPDATE {ROOT_SUBJECT_LATEST_TABLE}
+                    SET current_version = $1, did_document_hash = $2, metadata_hash = $3,
+                        current_controller_did = $4, control_revision = control_revision + 1,
+                        continuity_status = 'ready', continuity_error = NULL,
+                        operation = $5, updated_at = $6::timestamptz
+                    WHERE subject_did = $7 AND current_version = $8
+                      AND did_document_hash = $9 AND control_revision = $10
+                    "#
+                ))
+                .bind(version)
+                .bind(&package.did_document_hash)
+                .bind(&package.metadata_hash)
+                .bind(&transition.next_controller_did)
+                .bind(operation)
+                .bind(&now)
+                .bind(resource_did)
+                .bind(&current.current_version)
+                .bind(&current.did_document_hash)
+                .bind(current.control_revision)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+            } else {
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {ROOT_SUBJECT_LATEST_TABLE}(
+                        subject_did, current_version, did_document_hash, metadata_hash,
+                        current_controller_did, control_revision, continuity_status,
+                        operation, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, 1, 'ready', $6, $7::timestamptz)
+                    ON CONFLICT(subject_did) DO NOTHING
+                    "#
+                ))
+                .bind(resource_did)
+                .bind(version)
+                .bind(&package.did_document_hash)
+                .bind(&package.metadata_hash)
+                .bind(&transition.next_controller_did)
+                .bind(operation)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+            };
+            if affected != 1 {
+                return Err(anyhow::anyhow!("resource_previous_state_conflict"));
+            }
+        } else {
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {ROOT_SUBJECT_LATEST_TABLE}(subject_did, current_version, did_document_hash, metadata_hash, current_controller_did, control_revision, continuity_status, operation, updated_at)
+                VALUES ($1, $2, $3, $4, $5, 1, 'ready', $6, $7::timestamptz)
+                ON CONFLICT(subject_did)
+                DO UPDATE SET
+                    current_version = excluded.current_version,
+                    did_document_hash = excluded.did_document_hash,
+                    metadata_hash = excluded.metadata_hash,
+                    current_controller_did = excluded.current_controller_did,
+                    control_revision = {ROOT_SUBJECT_LATEST_TABLE}.control_revision + 1,
+                    operation = excluded.operation,
+                    updated_at = excluded.updated_at
+                "#
+            ))
+            .bind(resource_did)
+            .bind(version)
+            .bind(&package.did_document_hash)
+            .bind(&package.metadata_hash)
+            .bind(package.did_document.registration_controller()?.0)
+            .bind(operation)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(&format!(
             r#"
@@ -988,10 +1430,105 @@ pub(super) async fn persist_resource_acceptance_impl(
         .execute(&mut *tx)
         .await?;
 
+        if let Some(transition) = transition {
+            sqlx::query(&format!(
+                "UPDATE {ROOT_IDENTITY_BINDING_TABLE} SET status = 'superseded', updated_at = $1::timestamptz WHERE resource_did = $2 AND status = 'active'"
+            ))
+            .bind(&now)
+            .bind(resource_did)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(binding) = transition.next_binding.as_ref() {
+                let public_key_jwk = binding
+                    .public_key_jwk
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?;
+                let authorization = transition.authorizations.last();
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {ROOT_IDENTITY_BINDING_TABLE}(
+                        controller_did, resource_did, verification_method, public_key_jwk,
+                        public_key_multibase, accepted_at, status, authorized_by_did,
+                        authorization_proof_hash, package_version, binding_source, updated_at
+                    ) VALUES ($1, $2, $3, $4::jsonb, $5, $6::timestamptz, 'active', $7, $8, $9, 'verified-transition', $10::timestamptz)
+                    ON CONFLICT(controller_did, resource_did, verification_method)
+                    DO UPDATE SET
+                        public_key_jwk = excluded.public_key_jwk,
+                        public_key_multibase = excluded.public_key_multibase,
+                        accepted_at = excluded.accepted_at,
+                        status = 'active',
+                        authorized_by_did = excluded.authorized_by_did,
+                        authorization_proof_hash = excluded.authorization_proof_hash,
+                        package_version = excluded.package_version,
+                        binding_source = excluded.binding_source,
+                        updated_at = excluded.updated_at
+                    "#
+                ))
+                .bind(&binding.controller_did)
+                .bind(resource_did)
+                .bind(&binding.verification_method)
+                .bind(public_key_jwk)
+                .bind(&binding.public_key_multibase)
+                .bind(binding.accepted_at.to_rfc3339())
+                .bind(authorization.map(|value| value.authorizer_did.as_str()))
+                .bind(authorization.map(|value| value.proof_hash.as_str()))
+                .bind(version)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let authorizations_json = serde_json::to_string(&transition.authorizations)?;
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {ROOT_TRANSITION_AUDIT_TABLE}(
+                    resource_did, package_version, request_id, previous_version,
+                    previous_hash, next_hash, previous_controller_did,
+                    next_controller_did, authorizations_json, transition_source, accepted_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'verified-transition', $10::timestamptz)
+                "#
+            ))
+            .bind(resource_did)
+            .bind(version)
+            .bind(&transition.request_id)
+            .bind(
+                transition
+                    .expected_current
+                    .as_ref()
+                    .map(|value| value.current_version.as_str()),
+            )
+            .bind(
+                transition
+                    .expected_current
+                    .as_ref()
+                    .map(|value| value.did_document_hash.as_str()),
+            )
+            .bind(&package.did_document_hash)
+            .bind(
+                transition
+                    .expected_current
+                    .as_ref()
+                    .map(|value| value.current_controller_did.as_str()),
+            )
+            .bind(&transition.next_controller_did)
+            .bind(authorizations_json)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
         return Ok(());
     }
 
+    if transition
+        .and_then(|value| value.expected_current.as_ref())
+        .is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "resource_update_requires_transactional_storage"
+        ));
+    }
     let mut latest = super::read_latest_versions(state)?;
     latest.insert(
         resource_did.to_owned(),

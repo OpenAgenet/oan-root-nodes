@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use oan_bulletin::{Bulletin, BulletinEvent, BulletinEventCore, BulletinEventType};
 use oan_core::{
     CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
+    VerificationMethod,
 };
 use oan_credentials::{
     sign_credential_data_integrity, validate_infrastructure_authorization_credential,
@@ -41,15 +42,18 @@ use oan_protocol::{
     InfrastructureAuthorizationVcIssueRequest, ResourceVerifyAndPublishRequest,
     RootAuthorizeRequest, PATH_ROOT_INFRASTRUCTURE_AUTHORIZATION_VCS_ISSUE,
     PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
-    PURPOSE_INFRASTRUCTURE_AUTHORIZATION_VC_ISSUE, PURPOSE_VERIFY_AND_PUBLISH,
+    PURPOSE_INFRASTRUCTURE_AUTHORIZATION_VC_ISSUE, PURPOSE_RESOURCE_REGISTRATION,
+    PURPOSE_VERIFY_AND_PUBLISH,
 };
 use oan_publication_events::{CdnPublishRequestedEvent, CdnPublishRequestedEventInput};
 use oan_service_security::{
-    bearer_token_from_header, hash_proof, request_id,
-    validate_signed_request_envelope_before_nonce, verify_admin_token, verify_and_store_nonce,
-    verify_controller_authorization_proof, verify_signed_request_envelope_after_nonce,
+    bearer_token_from_header, find_relationship_method, request_id,
+    validate_signed_request_envelope_before_nonce, verify_admin_token,
+    verify_controller_authorization_proof_with_document,
+    verify_signed_request_envelope_after_nonce, verify_subject_control_proof_with_clock_skew,
     AdminAuthConfig, AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
-    SecurityError, TrustedUpstreamContext, TrustedUpstreamPolicy,
+    DidControlVerificationContext, SecurityError, TrustedUpstreamContext, TrustedUpstreamPolicy,
+    VerificationRelationship, VerifiedProof,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
@@ -89,6 +93,11 @@ const ROOT_IDENTITY_RESOURCE_TABLE: &str = "root_identity_resources";
 const ROOT_IDENTITY_BINDING_TABLE: &str = "root_identity_bindings";
 const ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE: &str = "root_identity_bootstrap_state";
 const ROOT_IDENTITY_DIRECTORY_TABLE: &str = "root_identity_directory";
+const ROOT_PROOF_NONCE_TABLE: &str = "root_resource_proof_nonces";
+const ROOT_TRANSITION_AUDIT_TABLE: &str = "root_resource_transition_audit";
+const ROOT_CONTINUITY_MIGRATION_TABLE: &str = "root_controller_continuity_migration";
+const ROOT_CONTINUITY_MIGRATION_NAME: &str = "controller_continuity_v1";
+const MAX_CONTROLLER_CHAIN_DEPTH: usize = 32;
 const ROOT_REQUEST_NONCE_CLEANUP_BATCH: i64 = 1_000;
 const ROOT_REQUEST_NONCE_CLEANUP_INTERVAL_SECONDS: u64 = 60;
 const ROOT_REQUEST_NONCE_CLEANUP_BACKLOG_INTERVAL_SECONDS: u64 = 1;
@@ -212,6 +221,46 @@ struct VerifiedAuthorityBinding {
     #[serde(rename = "acceptedAt")]
     accepted_at: DateTime<Utc>,
     status: String,
+}
+
+#[derive(Clone, Debug)]
+struct CurrentAcceptedResourceState {
+    resource_did: String,
+    current_version: String,
+    did_document_hash: String,
+    metadata_hash: String,
+    current_controller_did: String,
+    control_revision: i64,
+    package: ResourcePackage,
+}
+
+#[derive(Clone, Debug)]
+struct ControllerStateDependency {
+    resource_did: String,
+    current_version: String,
+    did_document_hash: String,
+    control_revision: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct VerifiedTransitionAuthorization {
+    authorizer_did: String,
+    verification_method: String,
+    proof_hash: String,
+    proof_nonce: String,
+    proof_kind: &'static str,
+    expires_at: DateTime<Utc>,
+    verified_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceAcceptanceTransition {
+    expected_current: Option<CurrentAcceptedResourceState>,
+    dependencies: Vec<ControllerStateDependency>,
+    authorizations: Vec<VerifiedTransitionAuthorization>,
+    next_controller_did: String,
+    next_binding: Option<VerifiedAuthorityBinding>,
+    request_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -634,6 +683,13 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }
@@ -1802,6 +1858,23 @@ fn mark_local_governance_inactive(
     Ok(())
 }
 
+async fn ensure_sqlite_column(
+    sqlite: &SqliteJsonStore,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(sqlite.pool())
+        .await?;
+    if !rows.iter().any(|row| row.get::<String, _>(1) == column) {
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+            .execute(sqlite.pool())
+            .await?;
+    }
+    Ok(())
+}
+
 async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
     sqlite
         .execute_batch(&format!(
@@ -1822,6 +1895,10 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 current_version TEXT NOT NULL,
                 did_document_hash TEXT NOT NULL,
                 metadata_hash TEXT NOT NULL,
+                current_controller_did TEXT,
+                control_revision INTEGER NOT NULL DEFAULT 0,
+                continuity_status TEXT NOT NULL DEFAULT 'ready',
+                continuity_error TEXT,
                 operation TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -1831,6 +1908,7 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 version TEXT NOT NULL,
                 did_document_hash TEXT NOT NULL,
                 metadata_hash TEXT NOT NULL,
+                package_hash TEXT NOT NULL DEFAULT '',
                 package_json TEXT NOT NULL,
                 archive_path TEXT NOT NULL,
                 accepted_at TEXT NOT NULL,
@@ -1896,8 +1974,42 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 public_key_multibase TEXT,
                 accepted_at TEXT NOT NULL,
                 status TEXT NOT NULL,
+                authorized_by_did TEXT,
+                authorization_proof_hash TEXT,
+                package_version TEXT,
+                binding_source TEXT NOT NULL DEFAULT 'verified-transition',
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(controller_did, resource_did, verification_method)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_PROOF_NONCE_TABLE} (
+                proof_kind TEXT NOT NULL,
+                signer_did TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(proof_kind, signer_did, nonce)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_TRANSITION_AUDIT_TABLE} (
+                resource_did TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                previous_version TEXT,
+                previous_hash TEXT,
+                next_hash TEXT NOT NULL,
+                previous_controller_did TEXT,
+                next_controller_did TEXT NOT NULL,
+                authorizations_json TEXT NOT NULL,
+                transition_source TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                PRIMARY KEY(resource_did, package_version)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_CONTINUITY_MIGRATION_TABLE} (
+                name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_subject_did TEXT,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} (
                 name TEXT PRIMARY KEY,
@@ -1917,6 +2029,52 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
             "#
         ))
         .await?;
+    ensure_sqlite_column(
+        sqlite,
+        ROOT_SUBJECT_VERSION_TABLE,
+        "package_hash",
+        "package_hash TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    ensure_sqlite_column(
+        sqlite,
+        ROOT_SUBJECT_LATEST_TABLE,
+        "current_controller_did",
+        "current_controller_did TEXT",
+    )
+    .await?;
+    ensure_sqlite_column(
+        sqlite,
+        ROOT_SUBJECT_LATEST_TABLE,
+        "control_revision",
+        "control_revision INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_sqlite_column(
+        sqlite,
+        ROOT_SUBJECT_LATEST_TABLE,
+        "continuity_status",
+        "continuity_status TEXT NOT NULL DEFAULT 'ready'",
+    )
+    .await?;
+    ensure_sqlite_column(
+        sqlite,
+        ROOT_SUBJECT_LATEST_TABLE,
+        "continuity_error",
+        "continuity_error TEXT",
+    )
+    .await?;
+    for (column, definition) in [
+        ("authorized_by_did", "authorized_by_did TEXT"),
+        ("authorization_proof_hash", "authorization_proof_hash TEXT"),
+        ("package_version", "package_version TEXT"),
+        (
+            "binding_source",
+            "binding_source TEXT NOT NULL DEFAULT 'verified-transition'",
+        ),
+    ] {
+        ensure_sqlite_column(sqlite, ROOT_IDENTITY_BINDING_TABLE, column, definition).await?;
+    }
     sqlite
         .execute_batch(&format!(
             "ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
@@ -1980,10 +2138,265 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
              WHERE publication_cursor IS NULL;"
         ))
         .await?;
+    if let Err(error) = initialize_controller_continuity_sqlite(sqlite).await {
+        let _ = sqlx::query(&format!(
+            "UPDATE {ROOT_CONTINUITY_MIGRATION_TABLE} SET status = 'failed', last_error = ?, updated_at = ? WHERE name = ?"
+        ))
+        .bind(error.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+        .execute(sqlite.pool())
+        .await;
+        return Err(error);
+    }
     sqlite.ensure_leased_job_table(ROOT_CDN_JOB_TABLE).await?;
     sqlite
         .ensure_leased_job_table(ROOT_CDN_OUTBOX_TABLE)
         .await?;
+    Ok(())
+}
+
+async fn initialize_controller_continuity_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {ROOT_CONTINUITY_MIGRATION_TABLE}(
+            name, status, last_subject_did, processed_count, last_error, updated_at
+        ) VALUES (?, 'backfilling', NULL, 0, NULL, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            status = CASE WHEN status = 'ready' THEN status ELSE 'backfilling' END,
+            last_error = NULL,
+            updated_at = excluded.updated_at
+        "#
+    ))
+    .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+    .bind(&now)
+    .execute(sqlite.pool())
+    .await?;
+
+    loop {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT latest.subject_did, versions.package_json
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.current_controller_did IS NULL
+              AND latest.continuity_status = 'ready'
+            ORDER BY latest.subject_did
+            LIMIT 500
+            "#
+        ))
+        .fetch_all(sqlite.pool())
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut tx = sqlite.pool().begin().await?;
+        for row in rows {
+            let subject_did = row.get::<String, _>(0);
+            let result = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))
+                .map_err(anyhow::Error::from)
+                .and_then(|package| {
+                    package
+                        .did_document
+                        .registration_controller()
+                        .map(|(controller, _)| controller)
+                        .map_err(anyhow::Error::from)
+                });
+            match result {
+                Ok(controller_did) => {
+                    sqlx::query(&format!(
+                        "UPDATE {ROOT_SUBJECT_LATEST_TABLE} SET current_controller_did = ?, control_revision = CASE WHEN control_revision < 1 THEN 1 ELSE control_revision END, continuity_status = 'ready', continuity_error = NULL WHERE subject_did = ?"
+                    ))
+                    .bind(controller_did)
+                    .bind(&subject_did)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Err(error) => {
+                    sqlx::query(&format!(
+                        "UPDATE {ROOT_SUBJECT_LATEST_TABLE} SET continuity_status = 'frozen', continuity_error = ? WHERE subject_did = ?"
+                    ))
+                    .bind(error.to_string())
+                    .bind(&subject_did)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            sqlx::query(&format!(
+                "UPDATE {ROOT_CONTINUITY_MIGRATION_TABLE} SET last_subject_did = ?, processed_count = processed_count + 1, updated_at = ? WHERE name = ?"
+            ))
+            .bind(&subject_did)
+            .bind(Utc::now().to_rfc3339())
+            .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+
+    sqlx::query(&format!(
+        "UPDATE {ROOT_IDENTITY_BINDING_TABLE} SET binding_source = 'migration-baseline' WHERE authorized_by_did IS NULL"
+    ))
+    .execute(sqlite.pool())
+    .await?;
+    sqlx::query(&format!(
+        r#"
+        UPDATE {ROOT_IDENTITY_BINDING_TABLE}
+        SET status = 'superseded'
+        WHERE status = 'active'
+          AND rowid NOT IN (
+              SELECT MAX(rowid)
+              FROM {ROOT_IDENTITY_BINDING_TABLE}
+              WHERE status = 'active'
+              GROUP BY resource_did
+          )
+        "#
+    ))
+    .execute(sqlite.pool())
+    .await?;
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_root_identity_bindings_one_active ON {ROOT_IDENTITY_BINDING_TABLE}(resource_did) WHERE status = 'active'"
+    ))
+    .execute(sqlite.pool())
+    .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_root_proof_nonces_expiry ON {ROOT_PROOF_NONCE_TABLE}(expires_at)"
+    ))
+    .execute(sqlite.pool())
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE {ROOT_CONTINUITY_MIGRATION_TABLE} SET status = 'ready', last_error = NULL, updated_at = ? WHERE name = ?"
+    ))
+    .bind(Utc::now().to_rfc3339())
+    .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+    .execute(sqlite.pool())
+    .await?;
+    Ok(())
+}
+
+async fn initialize_controller_continuity_postgres(postgres: &PostgresJsonStore) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {ROOT_CONTINUITY_MIGRATION_TABLE}(
+            name, status, last_subject_did, processed_count, last_error, updated_at
+        ) VALUES ($1, 'backfilling', NULL, 0, NULL, $2)
+        ON CONFLICT(name) DO UPDATE SET
+            status = CASE WHEN {ROOT_CONTINUITY_MIGRATION_TABLE}.status = 'ready' THEN {ROOT_CONTINUITY_MIGRATION_TABLE}.status ELSE 'backfilling' END,
+            last_error = NULL,
+            updated_at = excluded.updated_at
+        "#
+    ))
+    .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+    .bind(now)
+    .execute(postgres.pool())
+    .await?;
+
+    loop {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT latest.subject_did, versions.package_json::text
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.current_controller_did IS NULL
+              AND latest.continuity_status = 'ready'
+            ORDER BY latest.subject_did
+            LIMIT 500
+            "#
+        ))
+        .fetch_all(postgres.pool())
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut tx = postgres.pool().begin().await?;
+        for row in rows {
+            let subject_did = row.get::<String, _>(0);
+            let result = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))
+                .map_err(anyhow::Error::from)
+                .and_then(|package| {
+                    package
+                        .did_document
+                        .registration_controller()
+                        .map(|(controller, _)| controller)
+                        .map_err(anyhow::Error::from)
+                });
+            match result {
+                Ok(controller_did) => {
+                    sqlx::query(&format!(
+                        "UPDATE {ROOT_SUBJECT_LATEST_TABLE} SET current_controller_did = $1, control_revision = GREATEST(control_revision, 1), continuity_status = 'ready', continuity_error = NULL WHERE subject_did = $2"
+                    ))
+                    .bind(controller_did)
+                    .bind(&subject_did)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Err(error) => {
+                    sqlx::query(&format!(
+                        "UPDATE {ROOT_SUBJECT_LATEST_TABLE} SET continuity_status = 'frozen', continuity_error = $1 WHERE subject_did = $2"
+                    ))
+                    .bind(error.to_string())
+                    .bind(&subject_did)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            sqlx::query(&format!(
+                "UPDATE {ROOT_CONTINUITY_MIGRATION_TABLE} SET last_subject_did = $1, processed_count = processed_count + 1, updated_at = $2 WHERE name = $3"
+            ))
+            .bind(&subject_did)
+            .bind(Utc::now())
+            .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+
+    sqlx::query(&format!(
+        "UPDATE {ROOT_IDENTITY_BINDING_TABLE} SET binding_source = 'migration-baseline' WHERE authorized_by_did IS NULL"
+    ))
+    .execute(postgres.pool())
+    .await?;
+    sqlx::query(&format!(
+        r#"
+        WITH ranked AS (
+            SELECT ctid, ROW_NUMBER() OVER (
+                PARTITION BY resource_did ORDER BY accepted_at DESC, controller_did, verification_method
+            ) AS rank
+            FROM {ROOT_IDENTITY_BINDING_TABLE}
+            WHERE status = 'active'
+        )
+        UPDATE {ROOT_IDENTITY_BINDING_TABLE} AS bindings
+        SET status = 'superseded'
+        FROM ranked
+        WHERE bindings.ctid = ranked.ctid AND ranked.rank > 1
+        "#
+    ))
+    .execute(postgres.pool())
+    .await?;
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_root_identity_bindings_one_active ON {ROOT_IDENTITY_BINDING_TABLE}(resource_did) WHERE status = 'active'"
+    ))
+    .execute(postgres.pool())
+    .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_root_proof_nonces_expiry ON {ROOT_PROOF_NONCE_TABLE}(expires_at)"
+    ))
+    .execute(postgres.pool())
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE {ROOT_CONTINUITY_MIGRATION_TABLE} SET status = 'ready', last_error = NULL, updated_at = $1 WHERE name = $2"
+    ))
+    .bind(Utc::now())
+    .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+    .execute(postgres.pool())
+    .await?;
     Ok(())
 }
 
@@ -2007,6 +2420,10 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 current_version TEXT NOT NULL,
                 did_document_hash TEXT NOT NULL,
                 metadata_hash TEXT NOT NULL,
+                current_controller_did TEXT,
+                control_revision BIGINT NOT NULL DEFAULT 0,
+                continuity_status TEXT NOT NULL DEFAULT 'ready',
+                continuity_error TEXT,
                 operation TEXT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             );
@@ -2084,8 +2501,42 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 public_key_multibase TEXT,
                 accepted_at TIMESTAMPTZ NOT NULL,
                 status TEXT NOT NULL,
+                authorized_by_did TEXT,
+                authorization_proof_hash TEXT,
+                package_version TEXT,
+                binding_source TEXT NOT NULL DEFAULT 'verified-transition',
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(controller_did, resource_did, verification_method)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_PROOF_NONCE_TABLE} (
+                proof_kind TEXT NOT NULL,
+                signer_did TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(proof_kind, signer_did, nonce)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_TRANSITION_AUDIT_TABLE} (
+                resource_did TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                previous_version TEXT,
+                previous_hash TEXT,
+                next_hash TEXT NOT NULL,
+                previous_controller_did TEXT,
+                next_controller_did TEXT NOT NULL,
+                authorizations_json JSONB NOT NULL,
+                transition_source TEXT NOT NULL,
+                accepted_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(resource_did, package_version)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_CONTINUITY_MIGRATION_TABLE} (
+                name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_subject_did TEXT,
+                processed_count BIGINT NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMPTZ NOT NULL
             );
             CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} (
                 name TEXT PRIMARY KEY,
@@ -2139,6 +2590,22 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
             r#"
             ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
                 ADD COLUMN IF NOT EXISTS package_hash TEXT NOT NULL DEFAULT '';
+            ALTER TABLE {ROOT_SUBJECT_LATEST_TABLE}
+                ADD COLUMN IF NOT EXISTS current_controller_did TEXT;
+            ALTER TABLE {ROOT_SUBJECT_LATEST_TABLE}
+                ADD COLUMN IF NOT EXISTS control_revision BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE {ROOT_SUBJECT_LATEST_TABLE}
+                ADD COLUMN IF NOT EXISTS continuity_status TEXT NOT NULL DEFAULT 'ready';
+            ALTER TABLE {ROOT_SUBJECT_LATEST_TABLE}
+                ADD COLUMN IF NOT EXISTS continuity_error TEXT;
+            ALTER TABLE {ROOT_IDENTITY_BINDING_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_by_did TEXT;
+            ALTER TABLE {ROOT_IDENTITY_BINDING_TABLE}
+                ADD COLUMN IF NOT EXISTS authorization_proof_hash TEXT;
+            ALTER TABLE {ROOT_IDENTITY_BINDING_TABLE}
+                ADD COLUMN IF NOT EXISTS package_version TEXT;
+            ALTER TABLE {ROOT_IDENTITY_BINDING_TABLE}
+                ADD COLUMN IF NOT EXISTS binding_source TEXT NOT NULL DEFAULT 'verified-transition';
             ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
                 ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT 'unknown';
             ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
@@ -2186,6 +2653,17 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
             "#
         ))
         .await?;
+    if let Err(error) = initialize_controller_continuity_postgres(postgres).await {
+        let _ = sqlx::query(&format!(
+            "UPDATE {ROOT_CONTINUITY_MIGRATION_TABLE} SET status = 'failed', last_error = $1, updated_at = $2 WHERE name = $3"
+        ))
+        .bind(error.to_string())
+        .bind(Utc::now())
+        .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+        .execute(postgres.pool())
+        .await;
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -2272,6 +2750,9 @@ async fn verify_resource_and_publish_with_raw_document(
     request: ResourceVerifyAndPublishRequest,
     verified_did_document: VerifiedWireDidDocument,
 ) -> ApiResult<Value> {
+    ensure_controller_continuity_ready(&state)
+        .await
+        .map_err(ApiError::busy)?;
     let raw_did_document = verified_did_document.into_value();
     let admission_started = Instant::now();
     let _admission_permit = tokio::time::timeout(
@@ -2321,10 +2802,6 @@ async fn verify_resource_and_publish_with_raw_document(
     if metadata_hash != request.submission.metadata_hash {
         return Err(ApiError::bad_request("metadata_hash_mismatch"));
     }
-    let verified_authority_binding =
-        verify_controller_authorization_for_submission(&state, &request)
-            .await
-            .map_err(ApiError::bad_request)?;
     metadata.metadata_hash = metadata_hash.clone();
     metadata.package_hash = request.submission.package_hash.clone();
     let package_hash = hash_json_with_suite(
@@ -2343,6 +2820,49 @@ async fn verify_resource_and_publish_with_raw_document(
     if package_hash != request.submission.package_hash {
         return Err(ApiError::bad_request("package_hash_mismatch"));
     }
+
+    let current =
+        repository::current_accepted_resource_state_impl(&state, &request.submission.resource_did)
+            .await
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if let Some(current) = current.as_ref() {
+        if current.current_version == request.submission.package_version {
+            if current.did_document_hash == request.submission.did_document_hash
+                && current.metadata_hash == request.submission.metadata_hash
+                && current.package.package_hash == request.submission.package_hash
+            {
+                return Ok(resource_accepted_response(&current.package));
+            }
+            return Err(ApiError::conflict("resource_version_conflict"));
+        }
+    }
+    if current.is_some() && state.sqlite.is_none() && state.postgres.is_none() {
+        return Err(ApiError::internal(anyhow!(
+            "resource_update_requires_transactional_storage"
+        )));
+    }
+    let package_info = request
+        .submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.package_info.as_ref())
+        .ok_or_else(|| ApiError::bad_request("package_info_required"))?;
+    match current.as_ref() {
+        None if package_info.previous_version.is_some() => {
+            return Err(ApiError::conflict("resource_previous_state_conflict"));
+        }
+        Some(current)
+            if package_info.previous_version.as_deref()
+                != Some(current.current_version.as_str()) =>
+        {
+            return Err(ApiError::conflict("resource_previous_state_conflict"));
+        }
+        _ => {}
+    }
+    let transition = verify_resource_transition_authorization(&state, &request, current)
+        .await
+        .map_err(ApiError::bad_request)?;
 
     let package_claims = ResourcePackageClaims {
         resource_did: request.submission.resource_did.clone(),
@@ -2394,16 +2914,15 @@ async fn verify_resource_and_publish_with_raw_document(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     archive_resource_verified(&state, &package).map_err(ApiError::internal)?;
-    persist_resource_acceptance(&state, &package)
+    persist_resource_transition(&state, &package, &transition)
         .await
-        .map_err(ApiError::internal)?;
-    if let Some(binding) = verified_authority_binding {
-        persist_verified_authority_binding(&state, binding)
-            .await
-            .map_err(ApiError::internal)?;
-    }
+        .map_err(map_resource_acceptance_error)?;
 
-    Ok(Json(json!({
+    Ok(resource_accepted_response(&package))
+}
+
+fn resource_accepted_response(package: &ResourcePackage) -> Json<Value> {
+    Json(json!({
         "status": "resource-verified-and-queued",
         "resourceDid": package.resource_did,
         "resourceType": package.resource_type,
@@ -2413,7 +2932,45 @@ async fn verify_resource_and_publish_with_raw_document(
         "packageHash": package.package_hash,
         "lifecycleState": package.metadata.lifecycle_state,
         "cdnDispatchStatus": "queued"
-    })))
+    }))
+}
+
+fn map_resource_acceptance_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    match message.as_str() {
+        "resource_previous_state_conflict"
+        | "controller_state_changed"
+        | "resource_version_conflict"
+        | "proof_nonce_replayed" => ApiError::conflict(message),
+        _ => ApiError::internal(error),
+    }
+}
+
+async fn ensure_controller_continuity_ready(state: &AppState) -> std::result::Result<(), String> {
+    let status = if let Some(sqlite) = &state.sqlite {
+        sqlx::query_scalar::<_, String>(&format!(
+            "SELECT status FROM {ROOT_CONTINUITY_MIGRATION_TABLE} WHERE name = ?"
+        ))
+        .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+        .fetch_optional(sqlite.pool())
+        .await
+        .map_err(|error| error.to_string())?
+    } else if let Some(postgres) = &state.postgres {
+        sqlx::query_scalar::<_, String>(&format!(
+            "SELECT status FROM {ROOT_CONTINUITY_MIGRATION_TABLE} WHERE name = $1"
+        ))
+        .bind(ROOT_CONTINUITY_MIGRATION_NAME)
+        .fetch_optional(postgres.pool())
+        .await
+        .map_err(|error| error.to_string())?
+    } else {
+        Some("ready".to_owned())
+    };
+    if status.as_deref() == Some("ready") {
+        Ok(())
+    } else {
+        Err("controller_continuity_migration_not_ready".to_owned())
+    }
 }
 
 async fn authorize_registrar(
@@ -5203,9 +5760,6 @@ async fn identity_has_eligible_resource(state: &AppState, identity_did: &str) ->
     Ok(false)
 }
 
-fn verified_authority_binding_key(controller_did: &str, resource_did: &str) -> String {
-    format!("{controller_did}|{resource_did}")
-}
 
 fn load_verified_authority_bindings(
     state: &AppState,
@@ -5214,28 +5768,6 @@ fn load_verified_authority_bindings(
         .data
         .read("authority-bindings/verified-controller-bindings.json")
         .unwrap_or_default())
-}
-
-async fn persist_verified_authority_binding(
-    state: &AppState,
-    binding: VerifiedAuthorityBinding,
-) -> Result<()> {
-    if let Err(err) = upsert_identity_binding_projection(state, &binding).await {
-        eprintln!(
-            "identity directory binding projection skipped for {} controlled by {}: {err}",
-            binding.resource_did, binding.controller_did
-        );
-    }
-    let mut bindings = load_verified_authority_bindings(state)?;
-    bindings.insert(
-        verified_authority_binding_key(&binding.controller_did, &binding.resource_did),
-        binding,
-    );
-    state.data.write(
-        "authority-bindings/verified-controller-bindings.json",
-        &bindings,
-    )?;
-    Ok(())
 }
 
 async fn verify_resource_request_with_nonce_store(
@@ -5263,93 +5795,247 @@ async fn verify_resource_request_with_nonce_store(
 
 
 
-async fn verify_controller_authorization_for_submission(
+
+async fn resolve_controller_state(
+    state: &AppState,
+    controller_did: &str,
+    registrar_did: &str,
+) -> std::result::Result<CurrentAcceptedResourceState, String> {
+    validate_resource_routing_code(controller_did, registrar_did)?;
+    let controller = repository::current_accepted_resource_state_impl(state, controller_did)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "controller_not_registered".to_owned())?;
+    if controller.package.metadata.lifecycle_state != "active" {
+        return Err("controller_inactive".to_owned());
+    }
+    let (declared_controller, _) = controller
+        .package
+        .did_document
+        .registration_controller()
+        .map_err(|error| error.to_string())?;
+    if declared_controller != controller.current_controller_did {
+        return Err("controller_continuity_state_mismatch".to_owned());
+    }
+    Ok(controller)
+}
+
+fn dependency_from_state(state: &CurrentAcceptedResourceState) -> ControllerStateDependency {
+    ControllerStateDependency {
+        resource_did: state.resource_did.clone(),
+        current_version: state.current_version.clone(),
+        did_document_hash: state.did_document_hash.clone(),
+        control_revision: state.control_revision,
+    }
+}
+
+fn authorization_from_verified(
+    signer_did: String,
+    proof_kind: &'static str,
+    nonce: String,
+    expires_at: DateTime<Utc>,
+    verified: VerifiedProof,
+) -> VerifiedTransitionAuthorization {
+    VerifiedTransitionAuthorization {
+        authorizer_did: signer_did,
+        verification_method: verified.verification_method,
+        proof_hash: verified.proof_hash,
+        proof_nonce: nonce,
+        proof_kind,
+        expires_at,
+        verified_at: verified.verified_at,
+    }
+}
+
+fn canonical_controller_method(
+    document: &DidDocument,
+) -> std::result::Result<&VerificationMethod, String> {
+    find_relationship_method(
+        document,
+        VerificationRelationship::CapabilityInvocation,
+        None,
+    )
+    .or_else(|_| {
+        find_relationship_method(document, VerificationRelationship::AssertionMethod, None)
+    })
+    .map_err(|error| error.to_string())
+}
+
+async fn verify_resource_transition_authorization(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
-) -> std::result::Result<Option<VerifiedAuthorityBinding>, String> {
+    current: Option<CurrentAcceptedResourceState>,
+) -> std::result::Result<ResourceAcceptanceTransition, String> {
     let submission = &request.submission;
-    let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
-        return Ok(None);
-    };
-    let Some(controller_did) = metadata.controller_did.as_deref() else {
-        return Ok(None);
-    };
-    if controller_did == submission.resource_did {
-        return Ok(None);
+    let (next_controller_did, next_is_external) = submission
+        .did_document
+        .registration_controller()
+        .map_err(|error| error.to_string())?;
+    let current_is_self = current
+        .as_ref()
+        .map(|value| value.current_controller_did == submission.resource_did)
+        .unwrap_or(false);
+    if let Some(current) = current.as_ref() {
+        let (controller, _) = current
+            .package
+            .did_document
+            .registration_controller()
+            .map_err(|error| error.to_string())?;
+        if controller != current.current_controller_did {
+            return Err("resource_continuity_state_mismatch".to_owned());
+        }
     }
-    let Some(bundle) = submission.controller_authorization_proof.as_ref() else {
-        eprintln!(
-            "controller authorization proof missing at root for resource {} controlled by {}",
-            submission.resource_did, controller_did
-        );
-        return Err("controller_authorization_proof_required".to_owned());
+
+    let subject_document = if current_is_self {
+        &current
+            .as_ref()
+            .expect("current self-controlled state exists")
+            .package
+            .did_document
+    } else {
+        &submission.did_document
     };
-    verify_resource_did_document_for_wire(
-        serde_json::to_value(&bundle.controller_did_document)
-            .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
-    )
-    .await
-    .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
-    let expected_publisher_did = metadata.publisher_did.as_deref();
-    let verification_method_id = verify_controller_authorization_proof(
-        bundle,
-        &ControllerAuthorizationVerificationContext {
-            expected_resource_did: &submission.resource_did,
-            expected_controller_did: controller_did,
-            expected_publisher_did,
+    let subject_verified = verify_subject_control_proof_with_clock_skew(
+        &submission.subject_control_proof,
+        subject_document,
+        &DidControlVerificationContext {
+            expected_subject_did: &submission.resource_did,
             expected_did_document_hash: &submission.did_document_hash,
-            expected_metadata_hash: &submission.metadata_hash,
             expected_registrar_did: &request.registrar_did,
-            expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
-            max_clock_skew_seconds: 60,
+            expected_purpose: PURPOSE_RESOURCE_REGISTRATION,
             now: Utc::now(),
         },
+        60,
     )
-    .map_err(|err| {
-        let message = err.to_string();
-        eprintln!(
-            "controller authorization proof rejected at root for resource {} controlled by {}: {}",
-            submission.resource_did, controller_did, message
-        );
-        message
-    })?;
-    let verification_method = bundle
-        .controller_did_document
-        .verification_method
-        .iter()
-        .find(|method| method.id == verification_method_id)
-        .ok_or_else(|| "controller_authorization_verification_method_missing".to_owned())?;
-    let proof_hash = hash_proof(&bundle.proof).map_err(|err| err.to_string())?;
-    verify_and_store_nonce(
-        &state.config.paths.controller_authorization_nonce_file,
-        &bundle.challenge.nonce,
-        Utc::now(),
-        Utc::now(),
-        300,
-    )
-    .map_err(|err| {
-        if err.to_string() == "trusted_upstream_nonce_replayed" {
-            "controller_authorization_nonce_replayed".to_owned()
-        } else {
-            err.to_string()
+    .map_err(|error| error.to_string())?;
+    let subject_authorization = authorization_from_verified(
+        submission.resource_did.clone(),
+        "subject-control",
+        submission.subject_control_proof.challenge.nonce.clone(),
+        submission.subject_control_proof.challenge.expires_at,
+        subject_verified,
+    );
+    let mut authorizations = vec![subject_authorization.clone()];
+    let mut dependencies = Vec::new();
+    let mut transition_authorizer = subject_authorization;
+
+    let required_external_authorizer = match current.as_ref() {
+        Some(value) if value.current_controller_did != submission.resource_did => {
+            Some(value.current_controller_did.clone())
         }
-    })?;
-    Ok(Some(VerifiedAuthorityBinding {
-        controller_did: controller_did.to_owned(),
-        publisher_did: expected_publisher_did.map(ToOwned::to_owned),
-        resource_did: submission.resource_did.clone(),
-        resource_type: submission.resource_type.clone(),
-        package_version: submission.package_version.clone(),
-        did_document_hash: submission.did_document_hash.clone(),
-        metadata_hash: submission.metadata_hash.clone(),
-        verification_method: verification_method_id,
-        public_key_jwk: verification_method.public_key_jwk.clone(),
-        public_key_multibase: verification_method.public_key_multibase.clone(),
-        proof_hash,
-        verified_at: Utc::now(),
-        accepted_at: Utc::now(),
-        status: "active".to_owned(),
-    }))
+        None if next_is_external => Some(next_controller_did.clone()),
+        _ => None,
+    };
+    if let Some(authorizer_did) = required_external_authorizer {
+        let bundle = submission
+            .controller_authorization_proof
+            .as_ref()
+            .ok_or_else(|| "controller_authorization_proof_required".to_owned())?;
+        let controller_state =
+            resolve_controller_state(state, &authorizer_did, &request.registrar_did).await?;
+        let verified = verify_controller_authorization_proof_with_document(
+            bundle,
+            &controller_state.package.did_document,
+            &ControllerAuthorizationVerificationContext {
+                expected_resource_did: &submission.resource_did,
+                expected_controller_did: &authorizer_did,
+                expected_publisher_did: submission
+                    .did_document
+                    .oan_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.publisher_did.as_deref()),
+                expected_did_document_hash: &submission.did_document_hash,
+                expected_metadata_hash: &submission.metadata_hash,
+                expected_registrar_did: &request.registrar_did,
+                expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+                max_clock_skew_seconds: 60,
+                now: Utc::now(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        transition_authorizer = authorization_from_verified(
+            authorizer_did,
+            "controller-authorization",
+            bundle.challenge.nonce.clone(),
+            bundle.challenge.expires_at,
+            verified,
+        );
+        authorizations.push(transition_authorizer.clone());
+        dependencies.push(dependency_from_state(&controller_state));
+    }
+
+    let next_controller_state = if next_is_external {
+        let next =
+            resolve_controller_state(state, &next_controller_did, &request.registrar_did).await?;
+        dependencies.push(dependency_from_state(&next));
+        Some(next)
+    } else {
+        None
+    };
+
+    if let Some(next) = next_controller_state.as_ref() {
+        let mut visited = std::collections::BTreeSet::new();
+        let mut cursor = next.clone();
+        for _ in 0..MAX_CONTROLLER_CHAIN_DEPTH {
+            if !visited.insert(cursor.resource_did.clone()) {
+                return Err("controller_cycle_detected".to_owned());
+            }
+            if cursor.current_controller_did == cursor.resource_did {
+                break;
+            }
+            if cursor.current_controller_did == submission.resource_did {
+                return Err("controller_cycle_detected".to_owned());
+            }
+            cursor = resolve_controller_state(
+                state,
+                &cursor.current_controller_did,
+                &request.registrar_did,
+            )
+            .await?;
+            dependencies.push(dependency_from_state(&cursor));
+        }
+        if cursor.current_controller_did != cursor.resource_did {
+            return Err("controller_chain_depth_exceeded".to_owned());
+        }
+    }
+
+    dependencies.sort_by(|left, right| left.resource_did.cmp(&right.resource_did));
+    dependencies.dedup_by(|left, right| left.resource_did == right.resource_did);
+
+    let next_binding = if let Some(next) = next_controller_state.as_ref() {
+        let method = canonical_controller_method(&next.package.did_document)?;
+        Some(VerifiedAuthorityBinding {
+            controller_did: next_controller_did.clone(),
+            publisher_did: submission
+                .did_document
+                .oan_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.publisher_did.clone()),
+            resource_did: submission.resource_did.clone(),
+            resource_type: submission.resource_type.clone(),
+            package_version: submission.package_version.clone(),
+            did_document_hash: submission.did_document_hash.clone(),
+            metadata_hash: submission.metadata_hash.clone(),
+            verification_method: method.id.clone(),
+            public_key_jwk: method.public_key_jwk.clone(),
+            public_key_multibase: method.public_key_multibase.clone(),
+            proof_hash: transition_authorizer.proof_hash.clone(),
+            verified_at: transition_authorizer.verified_at,
+            accepted_at: Utc::now(),
+            status: "active".to_owned(),
+        })
+    } else {
+        None
+    };
+
+    Ok(ResourceAcceptanceTransition {
+        expected_current: current,
+        dependencies,
+        authorizations,
+        next_controller_did,
+        next_binding,
+        request_id: request.upstream_auth.request_id.clone(),
+    })
 }
 
 fn build_resource_metadata(
@@ -5399,10 +6085,9 @@ fn build_resource_metadata(
         .as_str()
         .unwrap_or_else(|| oan_metadata.lifecycle_state.as_deref().unwrap_or("active"))
         .to_owned();
-    let updated_at = submission
-        .subject_control_proof
-        .verified_at
-        .unwrap_or(submission.subject_control_proof.challenge.issued_at);
+    // `verifiedAt` is client-supplied metadata. Use the signed challenge time;
+    // server verification time is recorded separately in transition audit data.
+    let updated_at = submission.subject_control_proof.challenge.issued_at;
     Ok(ResourceMetadata {
         resource_did: submission.resource_did.clone(),
         resource_type: submission.resource_type.clone(),
@@ -5494,8 +6179,12 @@ fn archive_resource_verified(state: &AppState, package: &ResourcePackage) -> Res
     Ok(())
 }
 
-async fn persist_resource_acceptance(state: &AppState, package: &ResourcePackage) -> Result<()> {
-    repository::persist_resource_acceptance_impl(state, package).await?;
+async fn persist_resource_transition(
+    state: &AppState,
+    package: &ResourcePackage,
+    transition: &ResourceAcceptanceTransition,
+) -> Result<()> {
+    repository::persist_resource_transition_impl(state, package, transition).await?;
     if let Err(err) = upsert_identity_resource_projection(state, package).await {
         eprintln!(
             "identity directory resource projection skipped for {}: {err}",
@@ -5506,6 +6195,7 @@ async fn persist_resource_acceptance(state: &AppState, package: &ResourcePackage
     signal_worker_event(state, true);
     Ok(())
 }
+
 
 async fn enqueue_resource_cdn(state: &AppState, package: &ResourcePackage) -> Result<()> {
     let mut queue: Vec<ResourcePackage> = state
