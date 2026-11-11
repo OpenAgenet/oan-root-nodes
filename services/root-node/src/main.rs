@@ -2179,7 +2179,7 @@ async fn initialize_controller_continuity_sqlite(sqlite: &SqliteJsonStore) -> Re
             r#"
             SELECT latest.subject_did, versions.package_json
             FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
-            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+            LEFT JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
               ON versions.subject_did = latest.subject_did
              AND versions.version = latest.current_version
             WHERE latest.current_controller_did IS NULL
@@ -2196,8 +2196,12 @@ async fn initialize_controller_continuity_sqlite(sqlite: &SqliteJsonStore) -> Re
         let mut tx = sqlite.pool().begin().await?;
         for row in rows {
             let subject_did = row.get::<String, _>(0);
-            let result = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))
-                .map_err(anyhow::Error::from)
+            let package_json = row.get::<Option<String>, _>(1);
+            let result = package_json
+                .ok_or_else(|| anyhow!("resource_current_version_missing"))
+                .and_then(|value| {
+                    serde_json::from_str::<ResourcePackage>(&value).map_err(anyhow::Error::from)
+                })
                 .and_then(|package| {
                     package
                         .did_document
@@ -2278,6 +2282,15 @@ async fn initialize_controller_continuity_sqlite(sqlite: &SqliteJsonStore) -> Re
 }
 
 async fn initialize_controller_continuity_postgres(postgres: &PostgresJsonStore) -> Result<()> {
+    run_controller_continuity_postgres(postgres, None)
+        .await
+        .map(|_| ())
+}
+
+async fn run_controller_continuity_postgres(
+    postgres: &PostgresJsonStore,
+    max_batches: Option<usize>,
+) -> Result<bool> {
     let now = Utc::now();
     sqlx::query(&format!(
         r#"
@@ -2295,12 +2308,13 @@ async fn initialize_controller_continuity_postgres(postgres: &PostgresJsonStore)
     .execute(postgres.pool())
     .await?;
 
+    let mut completed_batches = 0usize;
     loop {
         let rows = sqlx::query(&format!(
             r#"
             SELECT latest.subject_did, versions.package_json::text
             FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
-            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+            LEFT JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
               ON versions.subject_did = latest.subject_did
              AND versions.version = latest.current_version
             WHERE latest.current_controller_did IS NULL
@@ -2317,8 +2331,12 @@ async fn initialize_controller_continuity_postgres(postgres: &PostgresJsonStore)
         let mut tx = postgres.pool().begin().await?;
         for row in rows {
             let subject_did = row.get::<String, _>(0);
-            let result = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))
-                .map_err(anyhow::Error::from)
+            let package_json = row.get::<Option<String>, _>(1);
+            let result = package_json
+                .ok_or_else(|| anyhow!("resource_current_version_missing"))
+                .and_then(|value| {
+                    serde_json::from_str::<ResourcePackage>(&value).map_err(anyhow::Error::from)
+                })
                 .and_then(|package| {
                     package
                         .did_document
@@ -2356,6 +2374,10 @@ async fn initialize_controller_continuity_postgres(postgres: &PostgresJsonStore)
             .await?;
         }
         tx.commit().await?;
+        completed_batches += 1;
+        if max_batches.is_some_and(|limit| completed_batches >= limit) {
+            return Ok(false);
+        }
     }
 
     sqlx::query(&format!(
@@ -2397,7 +2419,7 @@ async fn initialize_controller_continuity_postgres(postgres: &PostgresJsonStore)
     .bind(ROOT_CONTINUITY_MIGRATION_NAME)
     .execute(postgres.pool())
     .await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
